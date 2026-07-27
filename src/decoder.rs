@@ -49,6 +49,8 @@ pub struct DecoderHandle {
     pub rx: Receiver<RgbFrame>,
     pub duration: f64,
     pub source_size: (u32, u32),
+    /// Frames por segundo estimados del stream (avg_frame_rate).
+    pub fps: f64,
     pub eof: Arc<AtomicBool>,
     seek_tx: Sender<SeekReq>,
     resize_tx: Sender<(u32, u32)>,
@@ -120,6 +122,14 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
         ictx.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
     };
 
+    // fps medio del stream, para el fallback de frame-duration del player.
+    let afr = stream.avg_frame_rate();
+    let fps = if afr.numerator() > 0 && afr.denominator() > 0 {
+        f64::from(afr.numerator()) / f64::from(afr.denominator())
+    } else {
+        30.0
+    };
+
     let codec_params = stream.parameters();
     let dec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)?;
     let decoder = dec_ctx.decoder().video()?;
@@ -165,6 +175,7 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
         rx,
         duration,
         source_size: (src_w, src_h),
+        fps,
         eof,
         seek_tx,
         resize_tx,
@@ -227,6 +238,9 @@ fn decode_loop(
     // Empieza a Some(target) tras un seek y pasa a None cuando el primer
     // frame con pts>=target se emite (o al recibir un frame sin PTS válido).
     let mut drop_until_pts: Option<f64> = None;
+    // ¿Hemos llegado a EOF? En vez de matar el hilo, lo "aparcamos"
+    // esperando un seek (necesario para seeks tras el final y --loop).
+    let mut at_eof = false;
 
     'outer: loop {
         if stop.load(Ordering::Relaxed) {
@@ -241,17 +255,31 @@ fn decode_loop(
         }
         if let Some(req) = latest_seek {
             current_serial = req.serial;
-            // AVSEEK_FLAG_BACKWARD: garantiza posicionarse en un
-            // keyframe ANTERIOR o igual al target. Sin BACKWARD,
-            // ffmpeg puede saltar al keyframe SIGUIENTE, provocando
-            // que perdamos ~1-2 s de vídeo.
-            let ts_target = (req.target_secs * (tb_den / tb_num)) as i64;
-            // seek con rango [min, target] permite al demuxer elegir
-            // el keyframe óptimo <= target.
-            let _ = ictx.seek(ts_target, i64::MIN..ts_target);
+            // IMPORTANTE (unidades): `Input::seek` llama a
+            // `avformat_seek_file(ctx, -1, min, ts, max, 0)` con
+            // stream_index = -1, y en ese caso FFmpeg interpreta los
+            // timestamps en AV_TIME_BASE (microsegundos), NO en el
+            // time_base del stream. Antes se pasaban ticks del stream
+            // (p.ej. 1/15360) → el demuxer aterrizaba decénas de
+            // segundos ANTES del target y el drop-until-target tenía
+            // que decodificar minutos de vídeo → seeks lentísimos y
+            // A/V desincronizado. Con rango `..ts` el demuxer elige el
+            // keyframe óptimo <= target (equivalente a
+            // AVSEEK_FLAG_BACKWARD para hr-seek).
+            let ts_target =
+                (req.target_secs * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
+            let _ = ictx.seek(ts_target, ..ts_target);
             decoder.flush();
             drop_until_pts = Some(req.target_secs);
+            at_eof = false;
+            eof.store(false, Ordering::Relaxed);
             // No emitimos nada más de la iteración vieja.
+            continue;
+        }
+
+        // Aparcados en EOF: dormir y volver a mirar seeks/stop.
+        if at_eof {
+            thread::sleep(Duration::from_millis(25));
             continue;
         }
 
@@ -295,7 +323,10 @@ fn decode_loop(
                     &mut drop_until_pts,
                 );
                 eof.store(true, Ordering::Relaxed);
-                break 'outer;
+                // NO salimos del hilo: nos aparcamos esperando un
+                // posible seek hacia atrás o el restart de --loop.
+                at_eof = true;
+                continue 'outer;
             }
         };
 

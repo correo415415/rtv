@@ -35,6 +35,12 @@ use std::time::Duration;
 
 use crate::clock::FfClock;
 
+/// Petición de seek al hilo audio-decoder: target + serial nuevo.
+struct SeekMsg {
+    target_secs: f64,
+    serial: i32,
+}
+
 /// Bloque de muestras con serial + PTS del primer sample.
 struct AudioChunk {
     samples: Vec<f32>,
@@ -48,7 +54,7 @@ struct AudioChunk {
 pub struct AudioHandle {
     stop: Arc<AtomicBool>,
     volume: Arc<AtomicU8>,
-    seek_tx: Sender<f64>,
+    seek_tx: Sender<SeekMsg>,
     pub clock: Arc<FfClock>,
     pub has_audio: bool,
     pub sample_rate: u32,
@@ -71,7 +77,16 @@ impl AudioHandle {
     /// Como el serial ya está bumpeado en (1), cualquier chunk viejo
     /// que salga del ring durante (2)/(3) es silenciado por el callback.
     pub fn seek(&self, target_secs: f64) {
-        let _ = self.seek_tx.try_send(target_secs);
+        // El serial de referencia es el del RELOJ, que el player acaba
+        // de bumpear con `master.set(target)` ANTES de llamarnos. Así
+        // el pipeline de audio comparte exactamente el mismo serial que
+        // el reloj: los chunks pre-seek (serial viejo) se descartan en
+        // el callback y los post-seek (serial nuevo) anclan el reloj.
+        let serial = self.clock.current_serial();
+        let _ = self.seek_tx.try_send(SeekMsg {
+            target_secs,
+            serial,
+        });
     }
 
     pub fn pause_stream(&self) {
@@ -148,11 +163,10 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
 
     let stop = Arc::new(AtomicBool::new(false));
     let volume = Arc::new(AtomicU8::new(100));
-    let (seek_tx, seek_rx) = bounded::<f64>(4);
+    let (seek_tx, seek_rx) = bounded::<SeekMsg>(4);
 
     let decoder_join = {
         let stop = stop.clone();
-        let clock_dec = clock.clone();
         let path2 = path.clone();
         let tb_num = f64::from(time_base.numerator());
         let tb_den = f64::from(time_base.denominator());
@@ -171,7 +185,6 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
                     samples_rx_for_drain,
                     seek_rx,
                     stop,
-                    clock_dec,
                 );
             })?
     };
@@ -181,10 +194,18 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
         let stop_cb = stop.clone();
         let clock_cb = clock.clone();
         let volume_cb = volume.clone();
+        // Log de depuración opcional del callback (RTV_AUDIO_DEBUG=/ruta).
+        let mut dbg_log: Option<std::io::BufWriter<std::fs::File>> = std::env::var(
+            "RTV_AUDIO_DEBUG",
+        )
+        .ok()
+        .and_then(|p| std::fs::File::create(p).ok().map(std::io::BufWriter::new));
+        let dbg_origin = std::time::Instant::now();
+        let mut dbg_count: u64 = 0;
         // Estado local del callback:
         let mut leftover: Vec<f32> = Vec::new();
         let mut leftover_offset = 0usize;
-        let mut leftover_serial: i32 = -1;
+        let mut leftover_serial: i32 = 0;
         let mut leftover_first_pts: f64 = 0.0;
         // Muestras dentro del chunk actual ya emitidas (per-channel).
         let mut samples_emitted_in_chunk: usize = 0;
@@ -202,22 +223,26 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
                     return;
                 }
                 let vol_pct = volume_cb.load(Ordering::Relaxed) as f32 / 100.0;
+                // Serial válido AHORA (único serial compartido por reloj
+                // y pipeline). Se lee una vez al principio: si un seek
+                // ocurre a mitad de callback, el `set_pts` final será
+                // rechazado por el guard de serial del reloj.
                 let current_serial = clock_cb.current_serial();
 
                 let mut filled = 0usize;
-                // Cuando emitimos audio válido, guardamos el PTS del
-                // ÚLTIMO sample emitido en esta llamada. Con eso
-                // haremos un único `set_pts` al final.
-                let mut last_pts_emitted: Option<f64> = None;
+                // PTS del PRIMER sample válido emitido en esta llamada
+                // y su offset (en frames por-canal) dentro de `out`.
+                // El primer sample de `out` sale por el DAC en
+                // `ts.playback` — con eso anclamos el reloj.
+                let mut first_pts_emitted: Option<(f64, usize)> = None;
 
                 while filled < out.len() {
-                    // Chunk actual con serial viejo → silenciar y saltar
-                    // toda su porción pendiente sin tocar el reloj.
+                    // Chunk actual con serial viejo → DESCARTAR AL
+                    // INSTANTE (sin "reproducir" su duración como
+                    // silencio, que retrasaba el audio fresco tras un
+                    // seek en decenas de ms).
                     if leftover_offset < leftover.len() && leftover_serial != current_serial {
-                        let take = (out.len() - filled).min(leftover.len() - leftover_offset);
-                        out[filled..filled + take].fill(0.0);
-                        filled += take;
-                        leftover_offset += take;
+                        leftover_offset = leftover.len();
                         continue;
                     }
                     // Chunk agotado → traer otro.
@@ -239,49 +264,72 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
                         continue;
                     }
                     // Emisión válida.
+                    if first_pts_emitted.is_none() {
+                        let pts_here = leftover_first_pts
+                            + samples_emitted_in_chunk as f64 / out_sample_rate as f64;
+                        first_pts_emitted =
+                            Some((pts_here, filled / out_channels as usize));
+                    }
                     let take = (out.len() - filled).min(leftover.len() - leftover_offset);
                     for i in 0..take {
                         out[filled + i] = leftover[leftover_offset + i] * vol_pct;
                     }
                     filled += take;
                     leftover_offset += take;
-                    let take_per_ch = take / out_channels as usize;
-                    samples_emitted_in_chunk += take_per_ch;
-
-                    // PTS del último sample emitido = first_pts del chunk
-                    // + (samples_emitted_in_chunk - 1) / sample_rate.
-                    let last_sample_offset =
-                        (samples_emitted_in_chunk.saturating_sub(1)) as f64
-                            / out_sample_rate as f64;
-                    last_pts_emitted = Some(leftover_first_pts + last_sample_offset);
+                    samples_emitted_in_chunk += take / out_channels as usize;
                 }
 
                 // ---- Actualizar audclk con COMPENSACIÓN DE LATENCIA ----
-                if let Some(pts_last) = last_pts_emitted {
-                    // `playback_delay_samples` = muestras que ya
-                    // pasamos al driver pero AÚN NO HA REPRODUCIDO. Es
-                    // el equivalente de `audio_hw_buf_size` en ffplay.
-                    // cpal expone eso vía `info.timestamp()`.
-                    //
-                    //   playback = ts.playback   (cuándo saldrá al DAC)
-                    //   callback = ts.callback   (ahora, cuando se
-                    //                             ejecuta el callback)
+                if let Some((pts_first, frame_offset)) = first_pts_emitted {
+                    // cpal nos da:
+                    //   playback = ts.playback  (cuándo el PRIMER frame
+                    //                            de `out` sale por el DAC)
+                    //   callback = ts.callback  (ahora)
                     //   delay = playback - callback  (>0 normalmente)
                     //
-                    // Entonces el "PTS que se OYE ahora" es:
-                    //   pts_now_being_heard = pts_last - delay
-                    //
-                    // Con eso, `audclk.now() = pts_now_being_heard +
-                    // wall.elapsed_since_set`, que es exactamente lo
-                    // que oye el usuario.
+                    // El primer sample VÁLIDO emitido está en el frame
+                    // `frame_offset` del buffer, así que sonará en
+                    //   playback + frame_offset/rate.
+                    // Por tanto el PTS que se OYE en este instante es:
+                    //   pts_heard_now = pts_first
+                    //                   - frame_offset/rate
+                    //                   - delay
+                    // (la versión anterior usaba el PTS del ÚLTIMO
+                    // sample emitido sin restar la duración del buffer
+                    // → el reloj de audio corría ADELANTADO ~1 buffer
+                    // (5–40 ms) de forma sistemática).
                     let ts = info.timestamp();
-                    let delay_secs = ts
+                    let reported_delay = ts
                         .playback
                         .duration_since(&ts.callback)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or(0.0);
-                    let pts_being_heard = (pts_last - delay_secs).max(0.0);
+                    // Algunos backends (p.ej. ALSA→Pulse, null sinks,
+                    // ciertos drivers) reportan delay=0 aunque el
+                    // buffer que estamos rellenando NO sonará hasta que
+                    // drene el período en curso. Estimación mínima
+                    // robusta: la duración de UN período del callback
+                    // (ffplay hace lo mismo con audio_hw_buf_size).
+                    let buf_period_secs =
+                        (out.len() / out_channels as usize) as f64 / out_sample_rate as f64;
+                    let delay_secs = reported_delay.max(buf_period_secs);
+                    let offset_secs = frame_offset as f64 / out_sample_rate as f64;
+                    let pts_being_heard = (pts_first - offset_secs - delay_secs).max(0.0);
                     clock_cb.set_pts(pts_being_heard, current_serial);
+                    if let Some(log) = dbg_log.as_mut() {
+                        use std::io::Write as _;
+                        dbg_count += 1;
+                        let _ = writeln!(
+                            log,
+                            "{:.4} cb#{} buf={} pts_first={:.4} rep_delay={:.4} set={:.4}",
+                            dbg_origin.elapsed().as_secs_f64(),
+                            dbg_count,
+                            out.len(),
+                            pts_first,
+                            reported_delay,
+                            pts_being_heard,
+                        );
+                    }
                 }
             },
             |err| eprintln_verbose(&format!("cpal stream error: {err}")),
@@ -319,7 +367,7 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
 
 fn no_audio(clock: Arc<FfClock>) -> AudioHandle {
     let stop = Arc::new(AtomicBool::new(true));
-    let (seek_tx, _seek_rx) = bounded::<f64>(1);
+    let (seek_tx, _seek_rx) = bounded::<SeekMsg>(1);
     AudioHandle {
         stop,
         volume: Arc::new(AtomicU8::new(100)),
@@ -344,9 +392,8 @@ fn audio_decode_loop(
     out_channels: u16,
     samples_tx: Sender<AudioChunk>,
     samples_rx_for_drain: Receiver<AudioChunk>,
-    seek_rx: Receiver<f64>,
+    seek_rx: Receiver<SeekMsg>,
     stop: Arc<AtomicBool>,
-    clock: Arc<FfClock>,
 ) -> Result<()> {
     let mut ictx = input(&path)?;
     let dec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)?;
@@ -379,6 +426,18 @@ fn audio_decode_loop(
     // PTS running: lo actualizamos cada vez que decoder produce un
     // frame con PTS válido; los subsecuentes suman n_samples/rate.
     let mut running_pts: f64 = 0.0;
+    // Serial que este hilo está procesando ahora mismo. Los chunks se
+    // etiquetan con ÉSTE (no con el del reloj, que puede haber sido
+    // bumpeado por el player antes de que procesemos el seek).
+    let mut current_serial: i32 = 0;
+    // Tras un seek: recortar samples hasta llegar EXACTAMENTE al
+    // target. FFmpeg posiciona el demuxer en el paquete anterior al
+    // target, así que sin este recorte el audio empezaba ANTES del
+    // punto pedido (hasta ~1 s con AAC) → desincronía tras cada seek.
+    let mut trim_until_pts: Option<f64> = None;
+    // ¿EOF? Aparcamos el hilo esperando seek/stop (para seeks hacia
+    // atrás después de terminar y para --loop).
+    let mut at_eof = false;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -386,18 +445,29 @@ fn audio_decode_loop(
         }
 
         // Procesar seeks pendientes ANTES de leer paquete siguiente.
-        let mut seeked_to: Option<f64> = None;
-        while let Ok(target) = seek_rx.try_recv() {
-            seeked_to = Some(target);
+        let mut seeked_to: Option<SeekMsg> = None;
+        while let Ok(msg) = seek_rx.try_recv() {
+            seeked_to = Some(msg);
         }
-        if let Some(target) = seeked_to {
-            let ts = (target * (tb_den / tb_num)) as i64;
+        if let Some(msg) = seeked_to {
+            current_serial = msg.serial;
+            let target = msg.target_secs;
+            // Unidades: `Input::seek` → avformat_seek_file con
+            // stream_index=-1 → timestamps en AV_TIME_BASE (µs).
+            let ts = (target * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
             let _ = ictx.seek(ts, ..ts);
             decoder.flush();
-            // Vaciar ring: aunque el callback silenciaría por serial,
+            // Vaciar ring: aunque el callback descartaría por serial,
             // preferimos que llegue audio fresco cuanto antes.
             while samples_rx_for_drain.try_recv().is_ok() {}
             running_pts = target;
+            trim_until_pts = Some(target);
+            at_eof = false;
+        }
+
+        if at_eof {
+            thread::sleep(Duration::from_millis(25));
+            continue;
         }
 
         let pkt = match ictx.packets().next() {
@@ -417,12 +487,17 @@ fn audio_decode_loop(
                     &mut out_frame,
                     &samples_tx,
                     &stop,
-                    &clock,
+                    current_serial,
                     out_channels,
                     out_sample_rate,
                     &mut running_pts,
+                    &mut trim_until_pts,
                 );
-                break;
+                // Reset del decoder para poder reusarlo tras un seek
+                // hacia atrás (send_eof lo deja en estado draining).
+                decoder.flush();
+                at_eof = true;
+                continue;
             }
         };
 
@@ -447,13 +522,18 @@ fn audio_decode_loop(
             }
             let n_per_ch = samples.len() / out_channels as usize;
 
-            let chunk = AudioChunk {
+            if let Some(chunk) = make_trimmed_chunk(
                 samples,
-                serial: clock.current_serial(),
-                first_pts: running_pts,
-            };
-            if send_with_stop(&samples_tx, chunk, &stop).is_err() {
-                return Ok(());
+                running_pts,
+                n_per_ch,
+                current_serial,
+                out_channels,
+                out_sample_rate,
+                &mut trim_until_pts,
+            ) {
+                if send_with_stop(&samples_tx, chunk, &stop).is_err() {
+                    return Ok(());
+                }
             }
             // Avanzar running_pts para el próximo frame por si viene
             // sin PTS (algunos codecs lo hacen).
@@ -461,6 +541,44 @@ fn audio_decode_loop(
         }
     }
     Ok(())
+}
+
+/// Aplica el recorte post-seek: si el frame decodificado empieza antes
+/// del target, descarta los primeros samples para que el chunk emitido
+/// empiece EXACTAMENTE (sample-accurate) en el target. Devuelve None si
+/// el frame entero cae antes del target.
+fn make_trimmed_chunk(
+    mut samples: Vec<f32>,
+    first_pts: f64,
+    n_per_ch: usize,
+    serial: i32,
+    out_channels: u16,
+    out_sample_rate: u32,
+    trim_until_pts: &mut Option<f64>,
+) -> Option<AudioChunk> {
+    let mut chunk_first_pts = first_pts;
+    if let Some(target) = *trim_until_pts {
+        let end_pts = first_pts + n_per_ch as f64 / out_sample_rate as f64;
+        if end_pts <= target {
+            // Todo el frame es anterior al target → fuera.
+            return None;
+        }
+        if first_pts < target {
+            let skip_per_ch = (((target - first_pts) * out_sample_rate as f64) as usize)
+                .min(n_per_ch.saturating_sub(1));
+            samples.drain(..skip_per_ch * out_channels as usize);
+            chunk_first_pts = first_pts + skip_per_ch as f64 / out_sample_rate as f64;
+        }
+        *trim_until_pts = None;
+    }
+    if samples.is_empty() {
+        return None;
+    }
+    Some(AudioChunk {
+        samples,
+        serial,
+        first_pts: chunk_first_pts,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -471,10 +589,11 @@ fn drain_audio(
     out_frame: &mut AudioFrame,
     samples_tx: &Sender<AudioChunk>,
     stop: &Arc<AtomicBool>,
-    clock: &Arc<FfClock>,
+    current_serial: i32,
     out_channels: u16,
     out_sample_rate: u32,
     running_pts: &mut f64,
+    trim_until_pts: &mut Option<f64>,
 ) {
     while decoder.receive_frame(in_frame).is_ok() {
         if stop.load(Ordering::Relaxed) {
@@ -488,15 +607,21 @@ fn drain_audio(
             continue;
         }
         let n_per_ch = samples.len() / out_channels as usize;
-        let chunk = AudioChunk {
-            samples,
-            serial: clock.current_serial(),
-            first_pts: *running_pts,
-        };
-        if send_with_stop(samples_tx, chunk, stop).is_err() {
-            break;
-        }
+        let first_pts = *running_pts;
         *running_pts += n_per_ch as f64 / out_sample_rate as f64;
+        if let Some(chunk) = make_trimmed_chunk(
+            samples,
+            first_pts,
+            n_per_ch,
+            current_serial,
+            out_channels,
+            out_sample_rate,
+            trim_until_pts,
+        ) {
+            if send_with_stop(samples_tx, chunk, stop).is_err() {
+                break;
+            }
+        }
     }
 }
 
