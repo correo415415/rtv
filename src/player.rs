@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::{self, AudioHandle};
 use crate::clock::{
-    compute_target_delay, vp_duration, Clock, FfClock, MasterClock, AV_NOSYNC_THRESHOLD,
+    compute_target_delay, vp_duration, Clock, FfClock, MasterClock, AV_SYNC_THRESHOLD_MAX,
 };
 use crate::decoder;
 use crate::input::{self, Cmd};
@@ -133,10 +133,12 @@ pub fn run(cfg: Config) -> Result<()> {
     );
     dec.resize(dst_w, dst_h);
 
-    // Frame rate estimado del vídeo — para la duración "natural" en
-    // `compute_target_delay` cuando dos frames consecutivos tengan
-    // PTS raros o iguales.
-    let fallback_frame_dur: f64 = 1.0 / 30.0;
+    // Frame rate REAL del vídeo (avg_frame_rate del stream) — para la
+    // duración "natural" en `compute_target_delay` cuando dos frames
+    // consecutivos tengan PTS raros o iguales. Antes era 1/30 fijo, que
+    // desincronizaba vídeos a 24/25/50/60 fps en cuanto había un PTS
+    // inválido.
+    let fallback_frame_dur: f64 = if dec.fps > 1.0 { 1.0 / dec.fps } else { 1.0 / 30.0 };
     let max_frame_dur: f64 = 10.0;
 
     let mut renderer_ = Renderer::new(backend);
@@ -159,9 +161,24 @@ pub fn run(cfg: Config) -> Result<()> {
     //     frame. Se calcula frame a frame: `frame_timer += delay`.
     let mut last_shown_pts: f64 = 0.0;
     let mut frame_timer: f64 = wall_now_f64();
+    // Tras un seek estando en pausa, queremos decodificar y MOSTRAR el
+    // frame del target (una sola vez) sin salir de la pausa.
+    let mut show_one_frame_paused = false;
 
-    // Sincronización global inicial: fijamos el maestro en 0.
-    master.set(0.0);
+    // Log de sincronía opcional (para tests de integración):
+    // RTV_SYNC_LOG=/ruta/fichero → una línea por frame mostrado:
+    //   wall_s master_s video_pts_s avdiff_ms dropped_win
+    let mut sync_log: Option<std::io::BufWriter<std::fs::File>> =
+        std::env::var("RTV_SYNC_LOG").ok().and_then(|p| {
+            std::fs::File::create(p).ok().map(std::io::BufWriter::new)
+        });
+
+    // NOTA: NO llamamos a `master.set(0.0)` aquí. Los relojes nacen en
+    // pts=0, serial=0 y DESANCLADOS (now() == 0 congelado), igual que
+    // los productores (audio serial 0, decoder vídeo serial 0). El
+    // primer chunk de audio / frame de vídeo ancla el reloj y arranca
+    // el tiempo. Si hiciéramos set(0.0) bumpearíamos los seriales a 1
+    // dejando a los productores (serial 0) invalidados para siempre.
 
     'main: loop {
         // 1) Input.
@@ -185,14 +202,18 @@ pub fn run(cfg: Config) -> Result<()> {
                 }
                 Cmd::SeekRel(delta) => {
                     let now = master.now();
-                    let target = (now + delta).max(0.0).min(dec.duration.max(0.1));
+                    // Clamp: dejamos 0.5 s de margen antes del final para
+                    // no aterrizar en EOF exacto (pantalla congelada).
+                    let max_t = (dec.duration - 0.5).max(0.0);
+                    let target = (now + delta).max(0.0).min(max_t);
                     // ORDEN ATÓMICO:
                     //   (1) master.set(target) → bumpea serial en audclk
                     //       Y vidclk; cualquier chunk/frame en vuelo con
                     //       serial viejo será descartado por callback/player.
-                    //   (2) audio.seek(target) → decoder audio salta.
+                    //   (2) audio.seek(target) → decoder audio salta y
+                    //       recorta samples hasta el target exacto.
                     //   (3) dec.seek(target)   → decoder vídeo salta con
-                    //       BACKWARD + drop-until-target-PTS.
+                    //       keyframe<=target + drop-until-target-PTS.
                     master.set(target);
                     if let Some(a) = audio_handle.as_ref() {
                         a.seek(target);
@@ -203,6 +224,10 @@ pub fn run(cfg: Config) -> Result<()> {
                     frame_timer = wall_now_f64();
                     last_shown_pts = target;
                     force_full_redraw = true;
+                    if master.is_paused() {
+                        // En pausa: mostrar el frame del target una vez.
+                        show_one_frame_paused = true;
+                    }
                 }
                 Cmd::VolumeDelta(d) => {
                     volume = (volume + d).clamp(0, 200);
@@ -234,9 +259,28 @@ pub fn run(cfg: Config) -> Result<()> {
             }
         }
 
-        // 2) Pausa: dormimos un pelín y actualizamos HUD.
+        // 2) Pausa: dormimos un pelín y actualizamos HUD. Si hay un
+        //    seek pendiente de visualizar, sacamos UN frame del decoder
+        //    (el del target) y lo pintamos sin salir de la pausa.
         if master.is_paused() {
-            std::thread::sleep(Duration::from_millis(20));
+            if show_one_frame_paused {
+                if let Ok(frame) = dec.rx.recv_timeout(Duration::from_millis(200)) {
+                    if frame.serial == dec.current_serial() {
+                        let mut sol = so.lock();
+                        if force_full_redraw {
+                            let _ = write!(&mut sol, "\x1b[2J\x1b[H");
+                            force_full_redraw = false;
+                            renderer_.reset_layout_cache();
+                        }
+                        let _ = renderer_.draw(&mut sol, &frame, cols, rows, col_ox, row_oy);
+                        drop(sol);
+                        last_shown_pts = frame.pts;
+                        show_one_frame_paused = false;
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
             draw_hud_dispatch(
                 &mut so,
                 cols,
@@ -307,23 +351,20 @@ pub fn run(cfg: Config) -> Result<()> {
         frame_timer += target_delay;
         let now_wall = wall_now_f64();
 
-        // Si nos hemos quedado MUY retrasados (>NOSYNC), reseteamos
-        // el frame_timer para no arrastrar deuda de tiempo.
-        if (now_wall - frame_timer).abs() > AV_NOSYNC_THRESHOLD {
+        // ffplay: si el frame_timer se quedó atrás más de
+        // AV_SYNC_THRESHOLD_MAX (100 ms), resincronizamos al reloj
+        // mural para no arrastrar deuda de tiempo. (Antes el umbral
+        // era 10 s → tras cualquier hipo del render el bucle
+        // "perseguia" la deuda mostrando frames sin dormir, con el
+        // vídeo acelerado y desincronizado del audio.)
+        if now_wall - frame_timer > AV_SYNC_THRESHOLD_MAX {
             frame_timer = now_wall;
         }
 
-        // ¿Este frame llega tarde? → drop (pero mantenemos frame_timer
-        // avanzando para no acumular más deuda).
+        // ¿Este frame llega claramente tarde respecto al maestro?
+        // → drop (pero frame_timer ya avanzó, no acumulamos deuda).
         let master_diff = frame.pts - master.now();
-        if master_diff < -0.1 && !using_audio_leading_edge(using_audio) {
-            // Sin master de audio, tratamos "tarde" con menos agresividad.
-            frames_dropped_win += 1;
-            last_shown_pts = frame.pts;
-            continue;
-        }
-        if using_audio && master_diff < -0.1 {
-            // Muy tarde respecto al audio maestro → drop.
+        if master_diff.is_finite() && master_diff < -AV_SYNC_THRESHOLD_MAX {
             frames_dropped_win += 1;
             last_shown_pts = frame.pts;
             continue;
@@ -351,8 +392,25 @@ pub fn run(cfg: Config) -> Result<()> {
         // 7) Actualizar vidclk al PTS del frame que ACABAMOS de mostrar.
         //    Si no hay audio, esto es el reloj maestro. Con audio, sirve
         //    para el HUD y para futuros sync-to-slave.
-        vidclk.set_pts(frame.pts, cur_serial);
+        //    Usamos el serial PROPIO del vidclk como token: el filtrado
+        //    de frames obsoletos ya se hizo arriba contra el serial del
+        //    decoder (frame.serial != dec.current_serial() → skip), y
+        //    los contadores del reloj y del decoder son independientes.
+        vidclk.set_pts(frame.pts, vidclk.current_serial());
         last_shown_pts = frame.pts;
+
+        if let Some(log) = sync_log.as_mut() {
+            let m = master.now();
+            let _ = writeln!(
+                log,
+                "{:.4} {:.4} {:.4} {:+.1} {}",
+                wall_now_f64(),
+                m,
+                frame.pts,
+                (frame.pts - m) * 1000.0,
+                frames_dropped_win,
+            );
+        }
 
         draw_hud_dispatch(
             &mut so,
@@ -402,10 +460,6 @@ fn wall_now_f64() -> f64 {
     use once_cell::sync::Lazy;
     static ORIGIN: Lazy<Instant> = Lazy::new(Instant::now);
     ORIGIN.elapsed().as_secs_f64()
-}
-
-fn using_audio_leading_edge(using_audio: bool) -> bool {
-    using_audio
 }
 
 // -------------------- helpers de layout / HUD --------------------

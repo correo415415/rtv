@@ -61,13 +61,19 @@ pub struct FfClock {
 struct FfClockInner {
     /// PTS "base" (segundos absolutos en el media).
     pts: f64,
-    /// `pts - wall_time_at_update` — cuando el reloj corre,
-    /// `now = pts_drift + wall_now`. Es el truco de ffplay.
-    pts_drift: f64,
     /// Momento mural del último set (para paused clock).
     last_updated: Instant,
     /// PTS congelado durante pause.
     pts_at_pause: f64,
+    /// ¿Está el reloj "anclado" a datos reales del productor?
+    /// Tras un seek (`set`) pasa a false: `now()` devuelve el target
+    /// CONGELADO hasta que el productor (callback de audio / frame de
+    /// vídeo mostrado) haga el primer `set_pts` con el serial nuevo.
+    /// Equivale al reloj NaN de ffplay tras un seek — sin esto, el
+    /// reloj corría durante los ~100-300 ms que tarda el decoder en
+    /// rehidratarse, el primer frame del target llegaba "tarde", se
+    /// dropeaba, y el A/V arrancaba desincronizado tras cada seek.
+    anchored: bool,
 }
 
 impl FfClock {
@@ -76,9 +82,9 @@ impl FfClock {
         Arc::new(Self {
             inner: Mutex::new(FfClockInner {
                 pts: 0.0,
-                pts_drift: 0.0,
                 last_updated: now,
                 pts_at_pause: 0.0,
+                anchored: false,
             }),
             paused: AtomicU8::new(0),
             serial: AtomicI32::new(0),
@@ -92,17 +98,10 @@ impl FfClock {
         if serial != self.serial.load(Ordering::Acquire) {
             return; // residuo tras seek
         }
-        let time = Instant::now();
         let mut g = self.inner.lock();
         g.pts = pts;
-        g.pts_drift = pts - time.elapsed_secs_from(g.last_updated);
-        g.last_updated = time;
-        // Re-derivamos pts_drift limpiamente:
-        // pts_drift = pts - now_mural. `now_mural` = 0 desde el
-        // inicio de esta llamada. Para no acoplarnos a un origen
-        // arbitrario, guardamos el `Instant` en `last_updated` y en
-        // `now()` calculamos `pts + last_updated.elapsed()`.
-        g.pts_drift = pts;
+        g.last_updated = Instant::now();
+        g.anchored = true;
     }
 
     /// Bump del serial. Llamar ANTES de tocar el pts.
@@ -116,23 +115,16 @@ impl FfClock {
     }
 }
 
-// Extensión práctica para calcular elapsed relativo (evita panics si
-// last_updated está en el futuro respecto a `time`, cosa que no debería
-// pasar pero curémonos en salud).
-trait InstantExt {
-    fn elapsed_secs_from(&self, earlier: Instant) -> f64;
-}
-impl InstantExt for Instant {
-    fn elapsed_secs_from(&self, earlier: Instant) -> f64 {
-        self.saturating_duration_since(earlier).as_secs_f64()
-    }
-}
-
 impl Clock for FfClock {
     fn now(&self) -> f64 {
         let g = self.inner.lock();
         if self.paused.load(Ordering::Acquire) != 0 {
             return g.pts_at_pause;
+        }
+        // Sin anclar (justo tras seek / arranque): el tiempo queda
+        // congelado en el target hasta que llegue el primer dato real.
+        if !g.anchored {
+            return g.pts;
         }
         // now = pts + tiempo mural transcurrido desde el último set_pts.
         // Fórmula equivalente a la de ffplay `pts_drift + av_gettime()`
@@ -143,11 +135,10 @@ impl Clock for FfClock {
 
     fn pause(&self) {
         if self.paused.swap(1, Ordering::AcqRel) == 0 {
-            // Congelamos el pts efectivo en este instante.
-            let g = self.inner.lock();
-            let frozen = g.pts + g.last_updated.elapsed().as_secs_f64();
-            drop(g);
-            self.inner.lock().pts_at_pause = frozen;
+            // Congelamos el pts efectivo en este instante (un solo lock,
+            // sin ventana de carrera entre cálculo y escritura).
+            let mut g = self.inner.lock();
+            g.pts_at_pause = g.pts + g.last_updated.elapsed().as_secs_f64();
         }
     }
 
@@ -176,6 +167,9 @@ impl Clock for FfClock {
         g.pts = t.max(0.0);
         g.last_updated = now;
         g.pts_at_pause = t.max(0.0);
+        // Desanclar: `now()` devuelve `t` congelado hasta el primer
+        // `set_pts` de un productor con el serial nuevo.
+        g.anchored = false;
         // Serial ya bumpeado atómicamente arriba.
         let _ = new_serial;
     }
@@ -315,11 +309,22 @@ mod tests {
         let c = FfClock::new();
         c.set_pts(10.0, 0);
         sleep(Duration::from_millis(100));
-        let t = {
-            let g = c.inner.lock();
-            g.pts + g.last_updated.elapsed().as_secs_f64()
-        };
+        let t = c.now();
         assert!(t >= 10.09 && t < 10.20, "esperado ~10.10, got {t}");
+    }
+
+    #[test]
+    fn ffclock_frozen_after_seek_until_anchored() {
+        let c = FfClock::new();
+        c.set_pts(5.0, 0);
+        c.set(42.0); // seek → desanclado
+        sleep(Duration::from_millis(80));
+        // Congelado en el target mientras no llegue dato real.
+        assert!((c.now() - 42.0).abs() < 0.001, "reloj corrió desanclado: {}", c.now());
+        // Primer dato real con serial nuevo → re-ancla y corre.
+        c.set_pts(42.0, c.current_serial());
+        sleep(Duration::from_millis(60));
+        assert!(c.now() > 42.05, "reloj no corre tras re-anclar: {}", c.now());
     }
 
     #[test]
