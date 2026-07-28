@@ -90,6 +90,13 @@ pub fn run(cfg: Config) -> Result<()> {
 
     // --- Relojes independientes audio/vídeo ---
     let audclk_pre = FfClock::new(); // se pasa al audio thread
+    // Staleness del reloj de audio: los callbacks de cpal llegan cada
+    // 25-100 ms; si pasan >250 ms sin `set_pts` es que el dispositivo
+    // NO está consumiendo (stall de arranque de PulseAudio, underrun,
+    // EOF del stream de audio). El reloj se congela y `anchored()`
+    // pasa a false → el vídeo (esclavo) espera en vez de correr en
+    // silencio y luego saltar hacia atrás.
+    audclk_pre.set_staleness(0.25);
     let vidclk = FfClock::new();
 
     // --- Audio (opcional) ---
@@ -173,6 +180,21 @@ pub fn run(cfg: Config) -> Result<()> {
     // Guardamos el serial del vidclk para el que ya mostramos el frame
     // de espera.
     let mut held_frame_serial: Option<i32> = None;
+    // Instante en que empezó el hold — válvula de seguridad: si el
+    // audio no ancla en un tiempo razonable (p.ej. seek más allá del
+    // final del stream de audio), forzamos el anclaje para que el
+    // vídeo no se quede congelado para siempre.
+    let mut hold_started: Option<Instant> = None;
+    // SEEK ESTILO MPV (keyframe landing): al hacer seek NO tocamos el
+    // audio todavía. El decoder de vídeo aterriza en el keyframe
+    // <= target y emite ESE frame ya (salto instantáneo). Cuando el
+    // primer frame post-seek llega, re-apuntamos ambos relojes a su
+    // PTS real (retarget, sin bumpear seriales) y ENTONCES pedimos al
+    // audio que salte exactamente a ese PTS. Así imagen y sonido
+    // arrancan clavados en el mismo instante del media, sin tener que
+    // decodificar en silencio todo el GOP hasta el target (que con
+    // AV1 4K tardaba varios segundos y desincronizaba todo).
+    let mut pending_audio_landing = false;
 
     // Log de sincronía opcional (para tests de integración):
     // RTV_SYNC_LOG=/ruta/fichero → una línea por frame mostrado:
@@ -214,11 +236,13 @@ pub fn run(cfg: Config) -> Result<()> {
                     if let Some(log) = sync_log.as_mut() {
                         let _ = writeln!(
                             log,
-                            "# SEEK delta={:+.1} now={:.3} anchored={}",
+                            "# SEEK wall={:.4} delta={:+.1} now={:.3} anchored={}",
+                            wall_now_f64(),
                             delta,
                             now,
                             master.master_anchored(),
                         );
+                        let _ = log.flush();
                     }
                     // Clamp: dejamos 0.5 s de margen antes del final para
                     // no aterrizar en EOF exacto (pantalla congelada).
@@ -233,10 +257,11 @@ pub fn run(cfg: Config) -> Result<()> {
                     //   (3) dec.seek(target)   → decoder vídeo salta con
                     //       keyframe<=target + drop-until-target-PTS.
                     master.set(target);
-                    if let Some(a) = audio_handle.as_ref() {
-                        a.seek(target);
-                    }
                     dec.seek(target);
+                    // El audio saltará al PTS de ATERRIZAJE del vídeo
+                    // (keyframe <= target) cuando llegue el primer
+                    // frame post-seek — ver `pending_audio_landing`.
+                    pending_audio_landing = using_audio;
                     // Reseteamos frame_timer para que el próximo frame
                     // se muestre YA (sin arrastre del delay anterior).
                     frame_timer = wall_now_f64();
@@ -284,6 +309,16 @@ pub fn run(cfg: Config) -> Result<()> {
             if show_one_frame_paused {
                 if let Ok(frame) = dec.rx.recv_timeout(Duration::from_millis(200)) {
                     if frame.serial == dec.current_serial() {
+                        // Aterrizaje del seek en pausa: re-apuntar los
+                        // relojes al PTS real y alinear el audio para
+                        // que al reanudar suene EXACTAMENTE aquí.
+                        if pending_audio_landing {
+                            master.retarget(frame.pts);
+                            if let Some(a) = audio_handle.as_ref() {
+                                a.seek(frame.pts);
+                            }
+                            pending_audio_landing = false;
+                        }
                         let mut sol = so.lock();
                         if force_full_redraw {
                             let _ = write!(&mut sol, "\x1b[2J\x1b[H");
@@ -343,8 +378,15 @@ pub fn run(cfg: Config) -> Result<()> {
             && !master.master_anchored()
             && held_frame_serial == Some(dec.current_serial())
         {
-            std::thread::sleep(Duration::from_millis(4));
-            continue;
+            // Válvula: si el audio no ancla en 1.5 s (seek más allá
+            // del final del audio, dispositivo caído…), arrancamos el
+            // reloj igualmente para que el vídeo siga.
+            if hold_started.map(|t| t.elapsed() > Duration::from_millis(1500)).unwrap_or(false) {
+                master.master().force_anchor();
+            } else {
+                std::thread::sleep(Duration::from_millis(4));
+                continue;
+            }
         }
 
         // 3) Obtener siguiente frame (con timeout corto para poder
@@ -356,9 +398,7 @@ pub fn run(cfg: Config) -> Result<()> {
                     if cfg.loop_video {
                         master.set(0.0);
                         dec.seek(0.0);
-                        if let Some(a) = audio_handle.as_ref() {
-                            a.seek(0.0);
-                        }
+                        pending_audio_landing = using_audio;
                         frame_timer = wall_now_f64();
                         last_shown_pts = 0.0;
                         force_full_redraw = true;
@@ -390,6 +430,15 @@ pub fn run(cfg: Config) -> Result<()> {
         //      ancle el reloj. Así el vídeo "salta de golpe" al punto
         //      pedido y arranca EXACTAMENTE cuando suena el audio.
         if using_audio && !master.master_anchored() {
+            // Primer frame post-seek: PTS de aterrizaje real (keyframe
+            // <= target). Re-apuntamos relojes y saltamos el audio AHÍ.
+            if pending_audio_landing {
+                master.retarget(frame.pts);
+                if let Some(a) = audio_handle.as_ref() {
+                    a.seek(frame.pts);
+                }
+                pending_audio_landing = false;
+            }
             {
                 let mut sol = so.lock();
                 if force_full_redraw {
@@ -403,6 +452,7 @@ pub fn run(cfg: Config) -> Result<()> {
             last_shown_pts = frame.pts;
             frame_timer = wall_now_f64();
             held_frame_serial = Some(frame.serial);
+            hold_started = Some(Instant::now());
             if let Some(log) = sync_log.as_mut() {
                 let m = master.now();
                 let _ = writeln!(
@@ -441,14 +491,25 @@ pub fn run(cfg: Config) -> Result<()> {
         // espera como "deuda".
         if held_frame_serial.take().is_some() {
             frame_timer = wall_now_f64();
+            hold_started = None;
         }
 
         // 5) SYNC estilo ffplay: computamos el delay natural entre el
         //    frame previo y éste, y lo ajustamos por el drift respecto
         //    al master.
         let natural_delay = vp_duration(last_shown_pts, frame.pts, fallback_frame_dur, max_frame_dur);
+        // Semántica EXACTA de ffplay: diff = vidclk - master, donde
+        // vidclk extrapola el PTS del frame EN PANTALLA. Usar el PTS
+        // del frame PENDIENTE metía +1 frame de offset sistemático
+        // (~-40 ms de sesgo con vídeo a 25 fps).
+        let vid_now = vidclk.now();
         let master_now = master.now();
-        let target_delay = compute_target_delay(natural_delay, frame.pts, master_now);
+        let diff = if vid_now.is_finite() && master_now.is_finite() {
+            vid_now - master_now
+        } else {
+            0.0
+        };
+        let target_delay = compute_target_delay(natural_delay, diff);
 
         // Momento mural en el que "queremos" mostrar este frame.
         frame_timer += target_delay;
