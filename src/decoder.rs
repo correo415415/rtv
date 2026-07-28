@@ -157,11 +157,17 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
     let src_h = decoder.height();
     let src_fmt = decoder.format();
 
-    // Cola de 8 frames: absorbe el jitter de decode (con AV1 hay
-    // frames que tardan >100 ms y otros 10 ms). Con bounded(2) el
-    // render se quedaba sin frames en los picos y luego llegaban
-    // en ráfaga tarde.
-    let (tx, rx) = bounded::<RgbFrame>(8);
+    // Cola de pre-decode adaptativa por PRESUPUESTO DE MEMORIA
+    // (~48 MB): con frames pequeños (ascii/halfblocks) caben 64 →
+    // el decoder acumula ~2.5 s de colchón mientras el audio arranca
+    // (PulseAudio puede tardar ~2 s en el primer callback) o tras un
+    // seek, absorbiendo el warmup del decode AV1/HEVC 4K. Con frames
+    // grandes (kitty a 2K) se limita a 4-8 para no comerse la RAM.
+    // Con bounded(2) el decoder se quedaba BLOQUEADO durante el hold
+    // de arranque y luego nunca recuperaba el déficit (-580 ms fijos).
+    let frame_bytes = (dst_w.max(2) as usize) * (dst_h.max(2) as usize) * 3;
+    let cap = (48 * 1024 * 1024 / frame_bytes.max(1)).clamp(4, 64);
+    let (tx, rx) = bounded::<RgbFrame>(cap);
     let (seek_tx, seek_rx) = unbounded::<SeekReq>();
     let (resize_tx, resize_rx) = bounded::<(u32, u32)>(4);
     let stop = Arc::new(AtomicBool::new(false));

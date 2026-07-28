@@ -488,10 +488,16 @@ pub fn run(cfg: Config) -> Result<()> {
         }
         // Reloj anclado: si veníamos de un hold, resincronizamos el
         // frame_timer al reloj mural para no arrastrar el tiempo de
-        // espera como "deuda".
+        // espera como "deuda", y RE-ANCLAMOS vidclk al frame mostrado:
+        // vidclk se seteó al ENTRAR al hold y estuvo extrapolando en
+        // vacío todo el hold (no tiene staleness) → sin este re-set,
+        // `diff = vidclk.now() - master.now()` salía +[duración del
+        // hold], la "espera exacta" dormía 0.5 s (cap) y el vídeo
+        // arrancaba tarde tras cada anclaje del audio.
         if held_frame_serial.take().is_some() {
             frame_timer = wall_now_f64();
             hold_started = None;
+            vidclk.set_pts(last_shown_pts, vidclk.current_serial());
         }
 
         // 5) SYNC estilo ffplay: computamos el delay natural entre el
