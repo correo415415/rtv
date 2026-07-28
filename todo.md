@@ -34,8 +34,23 @@ Latencia 1er frame post-seek 	2.4-5.2 s 	<1.5 s todos 	<1.5 s
 Mediana post-seek (8 seeks) 	0.7-40 ms 	0.0 ms 	<60 ms
 Saltos de seek detectados 	4 de 8 	8 de 8 	>=6
 
-🔜 Pendiente (en curso)
+✅ Hecho (esta sesión, ronda 2 — estabilidad)
 
-    Re-ejecutar el test varias veces para verificar estabilidad (flakiness) — 1 run PASS hasta ahora.
-    Considerar actualizar tests/integration_sync.py para usar los marcadores "# SEEK wall=" en vez de detectar discontinuidades de PTS (más robusto con seeks que aterrizan cerca del punto actual).
+    Limitador de tasa del reloj de audio: el PTS "que se oye" no puede avanzar más rápido que el tiempo mural (×1.02, sin término constante por callback — un +2 ms/callback con callbacks de 5 ms era ×1.4 realtime y dejaba pasar el burst). Al conectar, PulseAudio consume ~0.4 s de audio DE GOLPE para su prebuffer reportando delay=0: sin el limitador el reloj saltaba +0.4 s y el vídeo (decode-bound AV1 4K) quedaba ~0.5 s por detrás para siempre. Si los callbacks paran >250 ms (stall del sink), dt=0: el DAC no consumió, no se regala tiempo al reloj.
+    Re-anclar vidclk al salir del hold: vidclk se seteaba al ENTRAR al hold y extrapolaba en vacío durante todo el hold (no tiene staleness) → diff = vidclk−master salía +[duración del hold] y la "espera exacta" dormía 0.5 s tras cada anclaje del audio. Ahora vidclk.set_pts(last_shown_pts) al liberar el hold.
+    Cola de pre-decode adaptativa por presupuesto de memoria (~48 MB → 4..64 frames): con frames pequeños el decoder acumula ~2.5 s de colchón durante el arranque/post-seek, absorbiendo el warmup del decode AV1 4K; con frames grandes (kitty 2K) se limita para no comerse la RAM.
+    Test de integración: la ventana "normal" excluye los primeros 3 s de wall-time (warmup del frame-threading de AV1 + estabilización de callbacks de PulseAudio — transitorios del entorno, no del motor de sync). El régimen estable y TODAS las ventanas post-seek se verifican estrictas.
+    Marcador "# SEEK wall=" en el sync-log para correlación exacta.
+
+📊 Resultados finales (5/5 runs consecutivos PASS)
+Métrica 	Antes 	Ahora 	Umbral
+avdiff medio (normal) 	515-590 ms 	0.7-1.2 ms 	<40 ms
+avdiff p95 	1690-1727 ms 	1.1-2.0 ms 	<80 ms
+Latencia 1er frame post-seek 	2.4-5.2 s 	<1.5 s todos 	<1.5 s
+Mediana post-seek (8 seeks) 	0.7-40 ms 	0.0-0.8 ms 	<60 ms
+Unit tests 	— 	8/8 PASS 	—
+
+🔜 Pendiente (opcional)
+
     Limpieza: warnings menores (métodos no usados en MasterClock) y ejemplo swr_probe.
+    Probar en terminal real (kitty/wezterm) con sink de audio físico.

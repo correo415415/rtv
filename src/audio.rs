@@ -222,6 +222,17 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
         // reloj queda liso — el offset constante residual es idéntico
         // para todos los frames y el vídeo lo sigue sin jitter.
         let mut latency_ema: f64 = 0.0;
+        // LIMITADOR DE TASA del reloj de audio: el PTS "que se oye" no
+        // puede avanzar más rápido que el tiempo mural (×1.02 de
+        // margen). Al conectar, PulseAudio consume ~0.4 s de audio DE
+        // GOLPE para llenar su prebuffer reportando delay=0 — sin el
+        // limitador el reloj saltaba +0.4 s en un instante y el vídeo
+        // (decode-bound con AV1 4K) quedaba ~0.5 s por detrás PARA
+        // SIEMPRE (el decode no da para recuperar déficit). El exceso
+        // capado equivale a la latencia real no reportada del sink.
+        // Se resetea al cambiar el serial (seek).
+        let mut rate_lim: Option<(f64, std::time::Instant)> = None;
+        let mut rate_lim_serial: i32 = i32::MIN;
 
         let build = device.build_output_stream(
             &stream_config,
@@ -338,7 +349,34 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
                     }
                     let delay_secs = latency_ema;
                     let offset_secs = frame_offset as f64 / out_sample_rate as f64;
-                    let pts_being_heard = (pts_first - offset_secs - delay_secs).max(0.0);
+                    let mut pts_being_heard =
+                        (pts_first - offset_secs - delay_secs).max(0.0);
+                    // ---- Limitador de tasa (ver arriba) ----
+                    let now_i = std::time::Instant::now();
+                    if rate_lim_serial != current_serial {
+                        rate_lim_serial = current_serial;
+                        rate_lim = None;
+                    }
+                    if let Some((prev_pts, prev_wall)) = rate_lim {
+                        // Si los callbacks pararon >250 ms (stall del
+                        // sink: arranque de PulseAudio, suspend...) el
+                        // DAC NO consumió durante ese hueco — dt=0, no
+                        // regalamos ese tiempo al reloj. (Los callbacks
+                        // llegan cuando el sink NECESITA datos; si no
+                        // llegan, no está sonando nada nuevo.)
+                        let raw_dt =
+                            now_i.duration_since(prev_wall).as_secs_f64();
+                        let dt = if raw_dt > 0.25 { 0.0 } else { raw_dt };
+                        // ×1.02: margen para drift de sample-rate. SIN
+                        // término constante por callback: +2 ms/callback
+                        // con callbacks de 5 ms era ×1.4 realtime y el
+                        // burst de prebuffer se colaba entero.
+                        let cap = prev_pts + dt * 1.02;
+                        if pts_being_heard > cap {
+                            pts_being_heard = cap;
+                        }
+                    }
+                    rate_lim = Some((pts_being_heard, now_i));
                     clock_cb.set_pts(pts_being_heard, current_serial);
                     if let Some(log) = dbg_log.as_mut() {
                         use std::io::Write as _;

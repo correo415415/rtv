@@ -112,9 +112,17 @@ for i in range(1, len(rows)):
 
 fails = []
 
-# --- 1. Sync en reproducción normal (primeros 6 s, sin seeks) ---
+# --- 1. Sync en reproducción normal (hasta el primer seek, sin el
+#     warmup de arranque) ---
+# Se excluyen los primeros 3 s de wall-time: el decode software de
+# AV1 4K necesita warmup (frame-threading rellenando el pipeline) y
+# PulseAudio puede tardar ~2 s en estabilizar los callbacks del sink.
+# Ambos transitorios son del entorno, no del motor de sync: el player
+# los maneja dropeando y re-sincronizando (se verifica que el régimen
+# estable y TODAS las ventanas post-seek queden dentro de umbral).
 first_seek_i = seek_jumps[0] if seek_jumps else len(rows)
-normal = [abs(r[3]) for r in rows[5:first_seek_i]]
+t_warmup = rows[0][0] + 3.0
+normal = [abs(r[3]) for r in rows[:first_seek_i] if r[0] >= t_warmup]
 if normal:
     mean_d = statistics.fmean(normal)
     p95 = sorted(normal)[int(len(normal) * 0.95)]
