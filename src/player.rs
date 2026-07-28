@@ -164,6 +164,15 @@ pub fn run(cfg: Config) -> Result<()> {
     // Tras un seek estando en pausa, queremos decodificar y MOSTRAR el
     // frame del target (una sola vez) sin salir de la pausa.
     let mut show_one_frame_paused = false;
+    // VÍDEO ESCLAVO DEL AUDIO también en arranque/post-seek: mientras
+    // el reloj maestro (audio) esté DESANCLADO (congelado esperando el
+    // primer chunk del serial nuevo), mostramos UN frame (el del
+    // target) y NOS QUEDAMOS QUIETOS. Sin esto, el vídeo avanzaba en
+    // free-run contra un reloj congelado (~0.5×–2×) y al anclarse el
+    // audio había que dropear/duplicar en ráfaga para resincronizar.
+    // Guardamos el serial del vidclk para el que ya mostramos el frame
+    // de espera.
+    let mut held_frame_serial: Option<i32> = None;
 
     // Log de sincronía opcional (para tests de integración):
     // RTV_SYNC_LOG=/ruta/fichero → una línea por frame mostrado:
@@ -202,6 +211,15 @@ pub fn run(cfg: Config) -> Result<()> {
                 }
                 Cmd::SeekRel(delta) => {
                     let now = master.now();
+                    if let Some(log) = sync_log.as_mut() {
+                        let _ = writeln!(
+                            log,
+                            "# SEEK delta={:+.1} now={:.3} anchored={}",
+                            delta,
+                            now,
+                            master.master_anchored(),
+                        );
+                    }
                     // Clamp: dejamos 0.5 s de margen antes del final para
                     // no aterrizar en EOF exacto (pantalla congelada).
                     let max_t = (dec.duration - 0.5).max(0.0);
@@ -303,6 +321,17 @@ pub fn run(cfg: Config) -> Result<()> {
             continue;
         }
 
+        // 2.5) HOLD post-seek/arranque con audio: si ya mostramos el
+        //      frame del target y el reloj maestro sigue congelado
+        //      (sin audio real aún), esperamos sin consumir más frames.
+        if using_audio
+            && !master.master_anchored()
+            && held_frame_serial == Some(dec.current_serial())
+        {
+            std::thread::sleep(Duration::from_millis(4));
+            continue;
+        }
+
         // 3) Obtener siguiente frame (con timeout corto para poder
         //    seguir procesando input y HUD si el decoder está lento).
         let frame = match dec.rx.recv_timeout(Duration::from_millis(50)) {
@@ -338,6 +367,65 @@ pub fn run(cfg: Config) -> Result<()> {
         if cur_pts_ms != last_dec_pts_ms {
             frames_dec_win += 1;
             last_dec_pts_ms = cur_pts_ms;
+        }
+
+        // 4.5) Reloj maestro DESANCLADO (audio aún sin arrancar tras
+        //      seek/arranque): mostramos este frame YA (es el frame
+        //      del target) y activamos el hold hasta que el audio
+        //      ancle el reloj. Así el vídeo "salta de golpe" al punto
+        //      pedido y arranca EXACTAMENTE cuando suena el audio.
+        if using_audio && !master.master_anchored() {
+            {
+                let mut sol = so.lock();
+                if force_full_redraw {
+                    let _ = write!(&mut sol, "\x1b[2J\x1b[H");
+                    force_full_redraw = false;
+                    renderer_.reset_layout_cache();
+                }
+                let _ = renderer_.draw(&mut sol, &frame, cols, rows, col_ox, row_oy);
+            }
+            vidclk.set_pts(frame.pts, vidclk.current_serial());
+            last_shown_pts = frame.pts;
+            frame_timer = wall_now_f64();
+            held_frame_serial = Some(frame.serial);
+            if let Some(log) = sync_log.as_mut() {
+                let m = master.now();
+                let _ = writeln!(
+                    log,
+                    "{:.4} {:.4} {:.4} {:+.1} {}",
+                    wall_now_f64(),
+                    m,
+                    frame.pts,
+                    (frame.pts - m) * 1000.0,
+                    frames_dropped_win,
+                );
+            }
+            draw_hud_dispatch(
+                &mut so,
+                cols,
+                rows,
+                hud_lines,
+                &*master,
+                dec.duration,
+                volume,
+                backend.name(),
+                cell_px,
+                dst_w,
+                dst_h,
+                fps_shown_now,
+                fps_dec_now,
+                dropped_last_win,
+                using_audio,
+                cfg.show_stats,
+                false,
+            );
+            continue;
+        }
+        // Reloj anclado: si veníamos de un hold, resincronizamos el
+        // frame_timer al reloj mural para no arrastrar el tiempo de
+        // espera como "deuda".
+        if held_frame_serial.take().is_some() {
+            frame_timer = wall_now_f64();
         }
 
         // 5) SYNC estilo ffplay: computamos el delay natural entre el
