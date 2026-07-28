@@ -92,6 +92,8 @@ finally:
 rows = []
 with open(LOG) as f:
     for line in f:
+        if line.startswith("#"):
+            continue
         p = line.split()
         if len(p) >= 5:
             rows.append((float(p[0]), float(p[1]), float(p[2]), float(p[3])))

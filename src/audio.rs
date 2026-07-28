@@ -213,6 +213,15 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
         let mut leftover_first_pts: f64 = 0.0;
         // Muestras dentro del chunk actual ya emitidas (per-channel).
         let mut samples_emitted_in_chunk: usize = 0;
+        // Estimación SUAVIZADA de la latencia de salida. El tamaño del
+        // buffer del callback puede alternar (p.ej. PulseAudio pide
+        // 25 ms / 50 ms alternos); usar el tamaño del callback ACTUAL
+        // como estimación metía un diente de sierra de ±25 ms en el
+        // reloj de audio que el vídeo perseguía (patrón -80/-40/+10 ms
+        // en el sync-log). Un EMA converge a la media estable y el
+        // reloj queda liso — el offset constante residual es idéntico
+        // para todos los frames y el vídeo lo sigue sin jitter.
+        let mut latency_ema: f64 = 0.0;
 
         let build = device.build_output_stream(
             &stream_config,
@@ -316,7 +325,13 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
                     // (ffplay hace lo mismo con audio_hw_buf_size).
                     let buf_period_secs =
                         (out.len() / out_channels as usize) as f64 / out_sample_rate as f64;
-                    let delay_secs = reported_delay.max(buf_period_secs);
+                    let raw_delay = reported_delay.max(buf_period_secs);
+                    if latency_ema == 0.0 {
+                        latency_ema = raw_delay;
+                    } else {
+                        latency_ema = 0.9 * latency_ema + 0.1 * raw_delay;
+                    }
+                    let delay_secs = latency_ema;
                     let offset_secs = frame_offset as f64 / out_sample_rate as f64;
                     let pts_being_heard = (pts_first - offset_secs - delay_secs).max(0.0);
                     clock_cb.set_pts(pts_being_heard, current_serial);
@@ -403,6 +418,13 @@ fn audio_decode_loop(
     let dec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)?;
     let mut decoder = dec_ctx.decoder().audio()?;
 
+    // Log de depuración del hilo decoder (RTV_AUDIO_DEC_DEBUG=/ruta).
+    let mut dec_log: Option<std::io::BufWriter<std::fs::File>> =
+        std::env::var("RTV_AUDIO_DEC_DEBUG").ok().and_then(|p| {
+            std::fs::File::create(p).ok().map(std::io::BufWriter::new)
+        });
+    let dec_origin = std::time::Instant::now();
+
     let in_sample_rate = decoder.rate();
     // AVChannelLayout DUEÑO (desligado del borrow del decoder) para
     // poder recrear el resampler tras cada seek.
@@ -462,8 +484,14 @@ fn audio_decode_loop(
             let target = msg.target_secs;
             // Unidades: `Input::seek` → avformat_seek_file con
             // stream_index=-1 → timestamps en AV_TIME_BASE (µs).
+            // OJO con el rango: `..ts` (exclusivo) produce
+            // max_ts = ts-1 < ts y avformat_seek_file devuelve EINVAL
+            // SIN MOVER el demuxer → los seeks hacia atrás dejaban el
+            // audio donde estaba (los hacia delante los enmascaraba el
+            // trim). Con `..=ts` es (INT64_MIN, ts, ts) = keyframe<=ts,
+            // exactamente como ffplay.
             let ts = (target * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
-            let _ = ictx.seek(ts, ..ts);
+            let _ = ictx.seek(ts, ..=ts);
             decoder.flush();
             // Recrear el resampler: su FIFO interno puede contener
             // samples pre-seek que saldrían etiquetados con el PTS
@@ -485,6 +513,17 @@ fn audio_decode_loop(
             running_pts = target;
             trim_until_pts = Some(target);
             at_eof = false;
+            if let Some(log) = dec_log.as_mut() {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    log,
+                    "{:.4} SEEK target={:.3} serial={}",
+                    dec_origin.elapsed().as_secs_f64(),
+                    target,
+                    current_serial
+                );
+                let _ = log.flush();
+            }
         }
 
         if at_eof {
@@ -560,6 +599,17 @@ fn audio_decode_loop(
                 out_sample_rate,
                 &mut trim_until_pts,
             ) {
+                if let Some(log) = dec_log.as_mut() {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        log,
+                        "{:.4} CHUNK pts={:.3} n={} serial={}",
+                        dec_origin.elapsed().as_secs_f64(),
+                        chunk.first_pts,
+                        chunk.samples.len() / out_channels as usize,
+                        chunk.serial
+                    );
+                }
                 if send_with_stop(&samples_tx, chunk, &stop, &seek_rx).is_err() {
                     return Ok(());
                 }
