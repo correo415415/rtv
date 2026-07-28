@@ -325,7 +325,12 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
                     // (ffplay hace lo mismo con audio_hw_buf_size).
                     let buf_period_secs =
                         (out.len() / out_channels as usize) as f64 / out_sample_rate as f64;
-                    let raw_delay = reported_delay.max(buf_period_secs);
+                    // Clamp superior: tras un underrun (ring vacío por
+                    // CPU starving) PulseAudio puede reportar delays
+                    // absurdos (>1 s) — sin límite, el reloj de audio
+                    // saltaba SEGUNDOS hacia atrás y el vídeo entraba
+                    // en free-run persiguiendo un master roto.
+                    let raw_delay = reported_delay.max(buf_period_secs).min(0.5);
                     if latency_ema == 0.0 {
                         latency_ema = raw_delay;
                     } else {

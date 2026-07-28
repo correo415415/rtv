@@ -8,14 +8,20 @@
 //!     contador. Los frames que salgan del pipeline con serial viejo
 //!     se descartan silenciosamente.
 //!
-//!   * **hr-seek con drop-until-target-PTS** (equivalente a mpv
-//!     `--hr-seek-framedrop=yes`, on por defecto en mpv): tras
-//!     `av_seek_frame` con `AVSEEK_FLAG_BACKWARD`, FFmpeg posiciona
-//!     al keyframe anterior al target. El decoder rehidrata desde
-//!     ese keyframe hacia adelante, pero DESCARTA en el propio hilo
-//!     todos los frames cuyo PTS < target_pts. Así el primer frame
-//!     que llega al player ES el frame del target, sin tener que
-//!     mostrar los intermedios ni acumular retraso.
+//!   * **Seek a keyframe (estilo mpv por defecto)**: tras
+//!     `avformat_seek_file` con max_ts=target, FFmpeg posiciona al
+//!     keyframe <= target. El decoder emite DESDE ESE KEYFRAME: el
+//!     primer frame post-seek aparece en ~1 frame de decode (salto
+//!     de golpe), en vez de decodificar en silencio todo el GOP
+//!     hasta el target (que con AV1 4K y GOPs de 3.5 s tardaba
+//!     varios segundos). El player alinea el AUDIO al PTS real de
+//!     aterrizaje del vídeo (frame.pts del primer frame), así que
+//!     no hay desincronía: simplemente se aterriza en el keyframe.
+//!
+//!   * **Decode multi-hilo**: `thread_count=0` (auto) + frame
+//!     threading. Sin esto, dav1d/AV1 4K decodificaba en UN hilo a
+//!     ~1.2× realtime, starving al hilo de audio → underruns y
+//!     saltos del reloj maestro.
 //!
 //!   * Ya no marcamos `last_pts_ms` — el reloj lo lleva el player
 //!     desde `vidclk.set_pts` en cada frame renderizado.
@@ -134,14 +140,28 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
     };
 
     let codec_params = stream.parameters();
-    let dec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)?;
+    let mut dec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)?;
+    // Decode multi-hilo (auto = nº de cores). Crítico para AV1/HEVC
+    // 4K por software: con 1 hilo el decode no llega a realtime y
+    // además roba CPU al hilo de audio (underruns → saltos de reloj).
+    {
+        let mut tc = ffmpeg::codec::threading::Config::kind(
+            ffmpeg::codec::threading::Type::Frame,
+        );
+        tc.count = 0; // 0 = auto (todos los cores)
+        dec_ctx.set_threading(tc);
+    }
     let decoder = dec_ctx.decoder().video()?;
 
     let src_w = decoder.width();
     let src_h = decoder.height();
     let src_fmt = decoder.format();
 
-    let (tx, rx) = bounded::<RgbFrame>(2);
+    // Cola de 8 frames: absorbe el jitter de decode (con AV1 hay
+    // frames que tardan >100 ms y otros 10 ms). Con bounded(2) el
+    // render se quedaba sin frames en los picos y luego llegaban
+    // en ráfaga tarde.
+    let (tx, rx) = bounded::<RgbFrame>(8);
     let (seek_tx, seek_rx) = unbounded::<SeekReq>();
     let (resize_tx, resize_rx) = bounded::<(u32, u32)>(4);
     let stop = Arc::new(AtomicBool::new(false));
@@ -235,12 +255,8 @@ fn decode_loop(
     let mut frame = VideoFrame::empty();
     let mut rgb = VideoFrame::empty();
     // Serial que el hilo cree que está procesando ahora mismo. Cuando
-    // recibe un SeekReq, actualiza current_serial + target_pts.
+    // recibe un SeekReq, actualiza current_serial.
     let mut current_serial: i32 = 0;
-    // Si es Some(target), estamos en modo "drop hasta llegar a este PTS".
-    // Empieza a Some(target) tras un seek y pasa a None cuando el primer
-    // frame con pts>=target se emite (o al recibir un frame sin PTS válido).
-    let mut drop_until_pts: Option<f64> = None;
     // ¿Hemos llegado a EOF? En vez de matar el hilo, lo "aparcamos"
     // esperando un seek (necesario para seeks tras el final y --loop).
     let mut at_eof = false;
@@ -279,7 +295,10 @@ fn decode_loop(
                 (req.target_secs * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
             let _ = ictx.seek(ts_target, ..=ts_target);
             decoder.flush();
-            drop_until_pts = Some(req.target_secs);
+            // Seek a keyframe (mpv-style): NO descartamos frames hasta
+            // el target. El primer frame decodificado (el keyframe
+            // <= target) SE EMITE tal cual → salto de golpe. El player
+            // alineará el audio a su PTS real.
             at_eof = false;
             eof.store(false, Ordering::Relaxed);
             // No emitimos nada más de la iteración vieja.
@@ -329,7 +348,6 @@ fn decode_loop(
                     tb_den,
                     current_serial,
                     &serial_atomic,
-                    &mut drop_until_pts,
                 );
                 eof.store(true, Ordering::Relaxed);
                 // NO salimos del hilo: nos aparcamos esperando un
@@ -353,19 +371,6 @@ fn decode_loop(
 
             let pts_ticks = frame.pts().unwrap_or(0);
             let pts_secs = pts_ticks as f64 * tb_num / tb_den;
-
-            // hr-seek framedrop: si aún no llegamos al target, drop.
-            // Damos margen de 1 frame (~33 ms a 30fps): si sobrepasamos
-            // el target por poco, mostramos ese frame, que es lo más
-            // cercano posible al punto solicitado.
-            if let Some(target) = drop_until_pts {
-                if pts_secs + 0.020 < target {
-                    // Aún no hemos llegado. Descartamos silenciosamente.
-                    continue;
-                }
-                // Llegamos: desactivamos el drop y mostramos éste.
-                drop_until_pts = None;
-            }
 
             if frame.width() != src_w || frame.height() != src_h {
                 if let Ok(new_sws) = SwsCtx::get(
@@ -460,7 +465,6 @@ fn drain(
     tb_den: f64,
     current_serial: i32,
     serial_atomic: &Arc<AtomicI32>,
-    drop_until_pts: &mut Option<f64>,
 ) {
     while decoder.receive_frame(frame).is_ok() {
         if stop.load(Ordering::Relaxed) {
@@ -471,12 +475,6 @@ fn drain(
         }
         let pts_ticks = frame.pts().unwrap_or(0);
         let pts_secs = pts_ticks as f64 * tb_num / tb_den;
-        if let Some(target) = *drop_until_pts {
-            if pts_secs + 0.020 < target {
-                continue;
-            }
-            *drop_until_pts = None;
-        }
         if sws.run(frame, rgb).is_err() {
             continue;
         }

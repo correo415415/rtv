@@ -74,6 +74,16 @@ struct FfClockInner {
     /// rehidratarse, el primer frame del target llegaba "tarde", se
     /// dropeaba, y el A/V arrancaba desincronizado tras cada seek.
     anchored: bool,
+    /// Máxima extrapolación permitida desde el último `set_pts` real
+    /// (segundos). Si el productor deja de alimentar el reloj (stall
+    /// del dispositivo de audio, underrun del ring, EOF del stream de
+    /// audio), `now()` se CONGELA en `pts + staleness` y `anchored()`
+    /// pasa a false — el vídeo (esclavo) se detiene en vez de correr
+    /// contra un reloj que ya no representa lo que se oye. Sin esto,
+    /// un stall de arranque de PulseAudio de ~2 s hacía avanzar el
+    /// vídeo 2 s en silencio y luego el master saltaba hacia atrás
+    /// (+1900 ms de avdiff). INFINITY = sin límite (vidclk).
+    staleness: f64,
 }
 
 impl FfClock {
@@ -85,6 +95,7 @@ impl FfClock {
                 last_updated: now,
                 pts_at_pause: 0.0,
                 anchored: false,
+                staleness: f64::INFINITY,
             }),
             paused: AtomicU8::new(0),
             serial: AtomicI32::new(0),
@@ -114,12 +125,56 @@ impl FfClock {
         self.serial.load(Ordering::Acquire)
     }
 
+    /// Configura la máxima extrapolación sin datos reales (ver campo
+    /// `staleness`). El player la fija en el reloj de AUDIO (≈250 ms;
+    /// los callbacks llegan cada 25-100 ms, así que 250 ms sin datos
+    /// = el dispositivo NO está consumiendo).
+    pub fn set_staleness(&self, secs: f64) {
+        self.inner.lock().staleness = secs.max(0.0);
+    }
+
     /// ¿Está el reloj anclado a datos reales del productor? Tras un
     /// `set()` (seek) devuelve false hasta el primer `set_pts` con el
-    /// serial nuevo. El player lo usa para decidir si el vídeo debe
-    /// ESPERAR (reloj congelado) o seguir el reloj corriendo.
+    /// serial nuevo. También devuelve false si el último dato real es
+    /// más viejo que `staleness` (stall/underrun/EOF del audio). El
+    /// player lo usa para decidir si el vídeo debe ESPERAR (reloj
+    /// congelado) o seguir el reloj corriendo.
     pub fn anchored(&self) -> bool {
-        self.inner.lock().anchored
+        let g = self.inner.lock();
+        if !g.anchored {
+            return false;
+        }
+        if self.paused.load(Ordering::Acquire) != 0 {
+            return true; // en pausa no hay datos nuevos y es normal
+        }
+        g.last_updated.elapsed().as_secs_f64() <= g.staleness
+    }
+
+    /// Re-apunta el target congelado SIN bumpear el serial. Se usa
+    /// cuando el vídeo aterriza en el keyframe real (<= target del
+    /// seek): el reloj pasa a estar congelado en el PTS de aterrizaje
+    /// para que el audio arranque alineado con la imagen mostrada.
+    pub fn retarget(&self, t: f64) {
+        let mut g = self.inner.lock();
+        g.pts = t.max(0.0);
+        g.last_updated = Instant::now();
+        g.pts_at_pause = t.max(0.0);
+        g.anchored = false;
+    }
+
+    /// Válvula de seguridad: ancla el reloj en su pts actual aunque
+    /// ningún productor haya escrito todavía. Se usa si el audio no
+    /// llega en un tiempo razonable tras un seek (p.ej. seek más allá
+    /// del final del stream de audio) — sin esto el vídeo se quedaba
+    /// congelado para siempre esperando un anclaje que nunca llega.
+    pub fn force_anchor(&self) {
+        let mut g = self.inner.lock();
+        // Congela el pts efectivo actual y re-arranca desde ahí
+        // (cubre tanto "nunca anclado" como "anclado pero stale").
+        let elapsed = g.last_updated.elapsed().as_secs_f64().min(g.staleness);
+        g.pts += elapsed;
+        g.last_updated = Instant::now();
+        g.anchored = true;
     }
 }
 
@@ -137,7 +192,8 @@ impl Clock for FfClock {
         // now = pts + tiempo mural transcurrido desde el último set_pts.
         // Fórmula equivalente a la de ffplay `pts_drift + av_gettime()`
         // pero con `Instant` que es monotónico y sin origen fijo.
-        let elapsed = g.last_updated.elapsed().as_secs_f64();
+        // Acotado a `staleness`: sin datos frescos el reloj se congela.
+        let elapsed = g.last_updated.elapsed().as_secs_f64().min(g.staleness);
         g.pts + elapsed
     }
 
@@ -146,7 +202,8 @@ impl Clock for FfClock {
             // Congelamos el pts efectivo en este instante (un solo lock,
             // sin ventana de carrera entre cálculo y escritura).
             let mut g = self.inner.lock();
-            g.pts_at_pause = g.pts + g.last_updated.elapsed().as_secs_f64();
+            let elapsed = g.last_updated.elapsed().as_secs_f64().min(g.staleness);
+            g.pts_at_pause = g.pts + elapsed;
         }
     }
 
@@ -224,6 +281,14 @@ impl MasterClock {
     pub fn master_anchored(&self) -> bool {
         self.master().anchored()
     }
+    /// Re-apunta AMBOS relojes al PTS de aterrizaje real de un seek
+    /// SIN bumpear seriales (los productores en vuelo siguen válidos).
+    pub fn retarget(&self, t: f64) {
+        self.vidclk.retarget(t);
+        if let Some(a) = &self.audclk {
+            a.retarget(t);
+        }
+    }
 }
 
 impl Clock for MasterClock {
@@ -261,9 +326,12 @@ impl Clock for MasterClock {
 
 // -------------------- compute_target_delay --------------------
 
-/// Reimplementa `compute_target_delay` de ffplay.c: dado el delay
-/// natural entre frames (por PTS), lo ajusta al drift respecto al
-/// master. Devuelve segundos a dormir antes de mostrar el próximo frame.
+/// Reimplementa `compute_target_delay` de ffplay.c con su semántica
+/// EXACTA: `diff = get_clock(vidclk) - get_master_clock()` — es decir,
+/// el drift entre el reloj de vídeo (PTS del frame EN PANTALLA,
+/// extrapolado) y el maestro. NO es "PTS del próximo frame - master":
+/// esa variante llevaba un +1 frame de offset baked-in que, combinado
+/// con la corrección suave, dejaba un sesgo sistemático de ~-40 ms.
 ///
 /// * Si el vídeo va TARDE respecto al master (diff <= -threshold):
 ///   `delay = max(0, delay + diff)` — muestra ya, o incluso dropea.
@@ -271,8 +339,7 @@ impl Clock for MasterClock {
 ///   `delay = delay + diff` — espera lo justo.
 /// * Si va ADELANTADO poco (diff >= threshold):
 ///   `delay = 2 * delay` — dobla el delay para dejarlo alcanzar.
-pub fn compute_target_delay(natural_delay: f64, video_pts: f64, master_now: f64) -> f64 {
-    let diff = video_pts - master_now;
+pub fn compute_target_delay(natural_delay: f64, diff: f64) -> f64 {
     let sync_threshold = natural_delay
         .max(AV_SYNC_THRESHOLD_MIN)
         .min(AV_SYNC_THRESHOLD_MAX);
@@ -281,7 +348,13 @@ pub fn compute_target_delay(natural_delay: f64, video_pts: f64, master_now: f64)
         if diff <= -sync_threshold {
             // Vídeo tarde → mostrar YA.
             return (natural_delay + diff).max(0.0);
-        } else if diff >= sync_threshold && natural_delay > AV_SYNC_FRAMEDUP_THRESHOLD {
+        } else if diff >= sync_threshold
+            && (natural_delay > AV_SYNC_FRAMEDUP_THRESHOLD || diff > AV_SYNC_THRESHOLD_MAX)
+        {
+            // Muy adelantado (o salto grande del master hacia atrás,
+            // p.ej. re-anclaje del audio tras un stall): esperar EXACTO.
+            // Con el doblado de ffplay un salto de +300 ms tardaba ~8
+            // frames en converger, todos mostrados fuera de sync.
             return natural_delay + diff;
         } else if diff >= sync_threshold {
             return 2.0 * natural_delay;
@@ -362,15 +435,59 @@ mod tests {
 
     #[test]
     fn compute_target_delay_matches_ffplay_ranges() {
-        // Vídeo justo en sync → delay natural intacto.
-        assert!((compute_target_delay(0.040, 5.0, 5.0) - 0.040).abs() < 1e-9);
+        // Vídeo justo en sync (diff=0) → delay natural intacto.
+        assert!((compute_target_delay(0.040, 0.0) - 0.040).abs() < 1e-9);
         // Vídeo TARDE 200ms → delay = max(0, 0.04-0.2) = 0.
-        assert_eq!(compute_target_delay(0.040, 4.8, 5.0), 0.0);
-        // Vídeo ADELANTADO 200ms (delay < FRAMEDUP) → doble delay.
-        let d = compute_target_delay(0.040, 5.2, 5.0);
+        assert_eq!(compute_target_delay(0.040, -0.2), 0.0);
+        // Vídeo ADELANTADO 60ms (delay < FRAMEDUP, diff < MAX) → doble delay.
+        let d = compute_target_delay(0.040, 0.06);
         assert!((d - 0.080).abs() < 1e-9, "esperado 0.080, got {d}");
+        // Vídeo MUY adelantado (200ms > THRESHOLD_MAX) → espera exacta.
+        let d = compute_target_delay(0.040, 0.2);
+        assert!((d - 0.240).abs() < 1e-9, "esperado 0.240, got {d}");
         // Diff > NOSYNC (10s) → devuelve delay natural sin ajuste.
-        assert_eq!(compute_target_delay(0.040, 100.0, 5.0), 0.040);
+        assert_eq!(compute_target_delay(0.040, 95.0), 0.040);
+    }
+
+    #[test]
+    fn retarget_keeps_serial_and_unanchors() {
+        let c = FfClock::new();
+        c.set(30.0); // seek → serial+1, congelado en 30
+        let s = c.current_serial();
+        c.retarget(27.5); // aterrizaje en keyframe real
+        assert_eq!(c.current_serial(), s, "retarget no debe bumpear serial");
+        assert!((c.now() - 27.5).abs() < 0.001, "congelado en el landing pts");
+        c.set_pts(27.5, s);
+        sleep(Duration::from_millis(50));
+        assert!(c.now() > 27.52, "reloj corre tras anclar en el landing");
+    }
+
+    #[test]
+    fn staleness_freezes_and_unanchors() {
+        let c = FfClock::new();
+        c.set_staleness(0.08);
+        c.set_pts(5.0, 0);
+        assert!(c.anchored());
+        sleep(Duration::from_millis(150));
+        // Congelado en pts + staleness, y des-anclado.
+        assert!((c.now() - 5.08).abs() < 0.02, "now={}", c.now());
+        assert!(!c.anchored(), "debería estar stale");
+        // Un dato fresco re-ancla y el reloj corre de nuevo.
+        c.set_pts(5.05, 0);
+        assert!(c.anchored());
+        sleep(Duration::from_millis(40));
+        assert!(c.now() > 5.08 && c.now() < 5.15, "now={}", c.now());
+    }
+
+    #[test]
+    fn force_anchor_starts_clock() {
+        let c = FfClock::new();
+        c.set(10.0);
+        assert!(!c.anchored());
+        c.force_anchor();
+        assert!(c.anchored());
+        sleep(Duration::from_millis(50));
+        assert!(c.now() > 10.04, "reloj corre tras force_anchor: {}", c.now());
     }
 
     #[test]
