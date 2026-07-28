@@ -269,9 +269,15 @@ fn decode_loop(
             // A/V desincronizado. Con rango `..ts` el demuxer elige el
             // keyframe óptimo <= target (equivalente a
             // AVSEEK_FLAG_BACKWARD para hr-seek).
+            // Rango INCLUSIVO `..=ts`: con `..ts` (exclusivo) el
+            // max_ts quedaba en ts-1 < ts y avformat_seek_file
+            // devolvía EINVAL sin mover el demuxer — el "seek" sólo
+            // funcionaba hacia delante gracias al drop-until-target
+            // (decodificando segundos de más) y hacia atrás NO
+            // funcionaba en absoluto.
             let ts_target =
                 (req.target_secs * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
-            let _ = ictx.seek(ts_target, ..ts_target);
+            let _ = ictx.seek(ts_target, ..=ts_target);
             decoder.flush();
             drop_until_pts = Some(req.target_secs);
             at_eof = false;

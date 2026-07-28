@@ -294,6 +294,21 @@ pub fn run(cfg: Config) -> Result<()> {
                         drop(sol);
                         last_shown_pts = frame.pts;
                         show_one_frame_paused = false;
+                        // Registrar también este frame en el sync-log:
+                        // es el "primer frame post-seek" aunque estemos
+                        // en pausa (el test de integración lo mide).
+                        if let Some(log) = sync_log.as_mut() {
+                            let m = master.now();
+                            let _ = writeln!(
+                                log,
+                                "{:.4} {:.4} {:.4} {:+.1} {}",
+                                wall_now_f64(),
+                                m,
+                                frame.pts,
+                                (frame.pts - m) * 1000.0,
+                                frames_dropped_win,
+                            );
+                        }
                     }
                 }
             } else {

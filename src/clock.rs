@@ -286,6 +286,15 @@ pub fn compute_target_delay(natural_delay: f64, video_pts: f64, master_now: f64)
         } else if diff >= sync_threshold {
             return 2.0 * natural_delay;
         }
+        // Corrección SUAVE dentro del umbral: ffplay tolera hasta
+        // ±sync_threshold sin corregir, lo que deja offsets
+        // sistemáticos de ~±40 ms clavados para siempre (p.ej. el
+        // establecido al anclar el audio tras un seek). Aplicamos una
+        // corrección proporcional (50% del diff por frame, acotada a
+        // ±30% del delay natural) que converge geométricamente a 0
+        // sin producir jitter visible.
+        let correction = (diff * 0.5).clamp(-natural_delay * 0.3, natural_delay * 0.3);
+        return (natural_delay + correction).max(0.0);
     }
     natural_delay
 }
