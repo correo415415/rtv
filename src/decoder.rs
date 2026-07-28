@@ -21,7 +21,7 @@
 //!     desde `vidclk.set_pts` en cada frame renderizado.
 
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use ffmpeg_the_third as ffmpeg;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
@@ -74,7 +74,10 @@ impl DecoderHandle {
         let new_serial = self.serial.fetch_add(1, Ordering::AcqRel) + 1;
         // Drenar frames antiguos del canal para bajar latencia.
         while self.rx.try_recv().is_ok() {}
-        let _ = self.seek_tx.try_send(SeekReq {
+        // Canal sin límite + send: un try_send podría descartar el
+        // último seek de una ráfaga y dejar vídeo y audio en targets
+        // distintos.
+        let _ = self.seek_tx.send(SeekReq {
             target_secs,
             serial: new_serial,
         });
@@ -139,7 +142,7 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
     let src_fmt = decoder.format();
 
     let (tx, rx) = bounded::<RgbFrame>(2);
-    let (seek_tx, seek_rx) = bounded::<SeekReq>(4);
+    let (seek_tx, seek_rx) = unbounded::<SeekReq>();
     let (resize_tx, resize_rx) = bounded::<(u32, u32)>(4);
     let stop = Arc::new(AtomicBool::new(false));
     let eof = Arc::new(AtomicBool::new(false));

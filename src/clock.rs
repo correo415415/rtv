@@ -113,6 +113,14 @@ impl FfClock {
     pub fn current_serial(&self) -> i32 {
         self.serial.load(Ordering::Acquire)
     }
+
+    /// ¿Está el reloj anclado a datos reales del productor? Tras un
+    /// `set()` (seek) devuelve false hasta el primer `set_pts` con el
+    /// serial nuevo. El player lo usa para decidir si el vídeo debe
+    /// ESPERAR (reloj congelado) o seguir el reloj corriendo.
+    pub fn anchored(&self) -> bool {
+        self.inner.lock().anchored
+    }
 }
 
 impl Clock for FfClock {
@@ -211,6 +219,10 @@ impl MasterClock {
     /// Reloj “maestro” — audio si hay, video si no.
     pub fn master(&self) -> &Arc<FfClock> {
         self.audclk.as_ref().unwrap_or(&self.vidclk)
+    }
+    /// ¿Está el reloj maestro anclado (produciendo tiempo real)?
+    pub fn master_anchored(&self) -> bool {
+        self.master().anchored()
     }
 }
 
