@@ -54,3 +54,50 @@ Unit tests 	— 	8/8 PASS 	—
 
     Limpieza: warnings menores (métodos no usados en MasterClock) y ejemplo swr_probe.
     Probar en terminal real (kitty/wezterm) con sink de audio físico.
+
+---
+
+# Tarea 2 (EN CURSO): resize de terminal robusto y súper dinámico
+
+Objetivo: que el resize de la terminal NO afecte a la reproducción (hoy crashea todo al cambiar de tamaño y apenas arranca en terminales pequeñas), que responda al más mínimo cambio, que la calidad escale con el tamaño (más grande = más calidad) y que no haya caídas de fps ni desincronización durante el resize.
+
+## 🔍 Diagnóstico (completado)
+
+    Causa raíz nº1 — SwsCtx::run() de ffmpeg-the-third "OutputChanged": run() dimensiona el
+    frame RGB de salida UNA sola vez (cuando está vacío); después exige que sus dims coincidan
+    con el contexto. El código viejo, al hacer resize, recreaba el SwsCtx con las nuevas dims
+    pero REUTILIZABA el frame rgb viejo → Error::OutputChanged en TODOS los run() posteriores →
+    el decoder no emite nada → el player espera para siempre ("crashea todo").
+    Causa nº2 — resize() drenaba la cola de frames pre-decodificados: se perdía todo el colchón
+    de vídeo (2.5 s) en cada evento de resize → caídas de fps y stalls en tormentas de resize.
+    Causa nº3 — canal de resize bounded: en tormentas de resize se descartaban eventos → el
+    decoder se quedaba escalando a dims viejas.
+    Causa nº4 — el renderer no recorta a los límites de la terminal: si llega un frame con dims
+    "viejas" (más grande que la terminal tras encoger), se escribe fuera de pantalla → basura /
+    pánico de crossterm.
+    Causa nº5 — terminales pequeñas: dims degeneradas (0/impar) al calcular el layout → sws con
+    dims inválidas o división por cero.
+
+## 📋 Plan
+
+    [x] decoder.rs: target_dims como Arc<AtomicU64> (pack w<<32|h) — resize() = store atómico,
+        SIN drenar la cola, sin canal, coalescencia gratis (siempre se lee el último valor).
+    [x] decoder.rs: struct Scaler { sws, rgb, in/out dims+fmt } — reconstruye contexto Y frame
+        de salida juntos si CUALQUIER dim cambia; en error resetea a None (se reconstruye en la
+        siguiente llamada). Nunca queda en estado roto → fix definitivo del OutputChanged.
+    [ ] decoder.rs: reescribir decode_loop() con la nueva firma (sin dst_w0/dst_h0/resize_rx),
+        leyendo target_dims por frame y escalando con Scaler; actualizar drain() igual.
+    [ ] renderer.rs: recorte a los límites de la terminal en TODOS los backends (halfblocks/
+        ascii/kitty) y tolerancia a frames con dims que no cuadran con el layout actual.
+    [ ] player.rs: recomputar layout por frame, cachear el último frame mostrado para redibujo
+        instantáneo en el resize, dims mínimas para terminales diminutas, y NO tocar los relojes
+        ni el sync en ningún caso durante el resize.
+    [ ] Test de integración de resize: tormenta de TIOCSWINSZ sobre el pty durante la
+        reproducción → sin crash, fps estable, sync-log limpio; re-ejecutar el test de sync para
+        confirmar cero regresiones.
+    [ ] Commit + PR completo del trabajo de resize.
+
+## Estado actual
+
+    src/decoder.rs a medio refactor (target_dims + Scaler ya aplicados; decode_loop()/drain()
+    pendientes de reescribir — la rama no compila hasta terminar ese paso).
