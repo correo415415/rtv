@@ -14,6 +14,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 mod audio;
 mod clock;
 mod decoder;
+mod hwdec;
 mod input;
 mod player;
 mod renderer;
@@ -49,6 +50,12 @@ struct Cli {
     #[arg(long)]
     no_audio: bool,
 
+    /// Decode por hardware: auto | none | vaapi | cuda | qsv | d3d11va |
+    /// dxva2 | videotoolbox | vulkan | drm | vdpau. `auto` prueba los
+    /// hwaccels de la plataforma y cae a software si ninguno funciona.
+    #[arg(long, default_value = "auto")]
+    hwdec: String,
+
     /// Dejar que FFmpeg y sus codecs escriban a stderr (útil para depurar).
     #[arg(long)]
     verbose: bool,
@@ -56,6 +63,16 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Validar --hwdec ANTES de silenciar stderr: un valor inválido
+    // debe verse (exit 2, convención de error de uso de CLI).
+    let hw_pref = match hwdec::HwPref::parse(&cli.hwdec) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
 
     // Silenciar libav antes de tocar nada. Ver comentarios largos en el
     // repositorio para el razonamiento (tres capas de log).
@@ -70,6 +87,10 @@ fn main() -> Result<()> {
 
     ffmpeg_the_third::init()?;
 
+    if cli.verbose {
+        eprintln!("hwaccels disponibles: {:?}", hwdec::available_types());
+    }
+
     player::run(player::Config {
         path: cli.path,
         forced_backend: cli.backend,
@@ -77,6 +98,7 @@ fn main() -> Result<()> {
         loop_video: cli.loop_video,
         show_stats: cli.stats,
         no_audio: cli.no_audio,
+        hw_pref,
     })
 }
 

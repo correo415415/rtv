@@ -188,71 +188,99 @@ Unit tests                               —               8/8 PASS        —
 
 ---
 
-# Tarea 4 (PLAN — sin empezar): decode por hardware (VAAPI / D3D11VA / VideoToolbox)
+# Tarea 4 (EN CURSO — Fases 0-2 hechas, Fase 3 validación a medias): decode por hardware (VAAPI / D3D11VA / VideoToolbox)
 
 Objetivo: descargar el decode de vídeo a la GPU cuando exista un hwaccel
 disponible, con fallback transparente a software. Caso motivador: AV1/HEVC 4K,
 que hoy satura los cores en decode software y limita fps/resolución de render.
 
-## Fase 0 — Investigación y decisiones de diseño
+## Fase 0 — Investigación y decisiones de diseño ✅ HECHA
 
-    [ ] Inventariar qué expone ffmpeg-the-third 5.0 del API de hwaccel de FFmpeg:
-        av_hwdevice_ctx_create, AVCodecContext.hw_device_ctx, av_hwframe_transfer_data,
-        AVPixelFormat negotiation (get_format callback). Verificar si hay bindings
-        seguros o si toca unsafe con ffmpeg_the_third::sys directamente.
-    [ ] Decidir la matriz de hwaccels por plataforma y orden de preferencia:
-          Linux:   VAAPI (Intel/AMD) → CUDA/NVDEC (NVIDIA) → software
-          Windows: D3D11VA → DXVA2 (legacy) → software
+    [x] Inventariar qué expone ffmpeg-the-third 5.0 del API de hwaccel de FFmpeg.
+        RESULTADO: NO hay wrapper seguro — todo va por ffmpeg::sys (bindgen).
+        Bindings verificados en target/.../bindings.rs:
+          * AVHWDeviceType es #[repr(transparent)] struct(pub c_uint) con consts
+            asociadas (NONE=0, VDPAU=1, CUDA=2, VAAPI=3, DXVA2=4, QSV=5,
+            VIDEOTOOLBOX=6, D3D11VA=7, DRM=8, VULKAN=11).
+          * AVPixelFormat(pub c_int): VAAPI=44, CUDA=117, NV12=23.
+          * AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX es _bindgen_ty_6(1) → .0.
+          * get_format: Option<unsafe extern "C" fn(*mut AVCodecContext,
+            *const AVPixelFormat) -> AVPixelFormat>; hw_device_ctx: *mut AVBufferRef.
+        Todo el unsafe queda aislado en src/hwdec.rs.
+    [x] Matriz de hwaccels por plataforma y orden de preferencia (implementada
+        en hwdec::platform_preference):
+          Linux:   VAAPI → CUDA → QSV → VDPAU → Vulkan → DRM → software
+          Windows: D3D11VA → DXVA2 → CUDA → QSV → Vulkan → software
           macOS:   VideoToolbox → software
-    [ ] Decidir la estrategia de descarga de frames: siempre transferir a RAM
-        (av_hwframe_transfer_data → NV12) y convertir NV12→RGB24 con sws, porque
-        el destino final es el terminal (CPU). Documentar el coste del copy-back
-        y por qué NO interesa zero-copy (no hay GPU en el sink).
-    [ ] Medir baseline de rendimiento software (fps decode, uso de CPU, W) con
-        el vídeo de referencia (dQw4w9WgXcQ 4K AV1) para comparar después.
-    [ ] Investigar disponibilidad de hw decode AV1 (solo GPUs recientes: Intel
-        Xe/Arc, AMD RDNA2+, NVIDIA RTX 30+) y definir el fallback por codec.
+    [x] Estrategia de descarga: copy-back a RAM (av_hwframe_transfer_data →
+        NV12) + sws NV12→RGB24. Zero-copy no interesa: el sink es un terminal
+        y las celdas se generan en CPU sí o sí; el ahorro está en el decode.
+    [x] Baseline software medido (sandbox 2 cores, ffmpeg -threads 0):
+        10 s de 4K AV1 decodificados en 4.575 s wall ≈ 2.2× realtime con ambos
+        cores saturados — el margen para el resto del pipeline es escaso: el
+        hwdec libera exactamente esa CPU.
+    [x] AV1 hw decode escasea (Intel Xe/Arc, AMD RDNA2+, NVIDIA RTX 30+).
+        El fallback por codec sale GRATIS de la negociación: avcodec_get_hw_config
+        enumera por DECODER — si el decoder AV1 no anuncia VAAPI, ni se intenta;
+        y si el device_ctx no se puede crear (sin GPU, headless) → siguiente
+        candidato → software. No hace falta lógica por codec explícita.
 
-## Fase 1 — Infraestructura de dispositivo hw
+## Fase 1 — Infraestructura de dispositivo hw ✅ HECHA
 
-    [ ] Módulo nuevo src/hwdec.rs: enumeración de hwaccels disponibles en runtime
-        (av_hwdevice_iterate_types), creación del hw_device_ctx con manejo de
-        errores (dispositivo ocupado, sin permisos /dev/dri, headless).
-    [ ] CLI: --hwdec <auto|none|vaapi|d3d11va|videotoolbox|cuda> (default: auto)
-        y mostrar el hwaccel activo en el HUD junto al backend de render.
-    [ ] Selección del decoder: probar hwaccel elegido con el codec del stream;
-        si get_format no ofrece el pix_fmt hw o falla la creación → log claro
-        (con --verbose) y fallback a software SIN abortar.
+    [x] Módulo nuevo src/hwdec.rs: HwPref (Auto|None|Only) + parse; enumeración
+        runtime (available_types vía av_hwdevice_iterate_types); try_enable()
+        recorre avcodec_get_hw_config del decoder, crea el device ctx
+        (av_hwdevice_ctx_create — falla limpio sin /dev/dri, sin permisos,
+        headless → siguiente candidato), engancha hw_device_ctx + get_format;
+        ActiveHw es dueño del AVBufferRef (Drop → av_buffer_unref).
+        get_format_cb elige el fmt publicado en la static atómica
+        EXPECTED_HW_FMT (un decoder de vídeo por proceso; si algún día hay N,
+        pasa a ctx.opaque) y si no está, el primer fmt no-HWACCEL (sw).
+    [x] CLI: --hwdec <auto|none|vaapi|cuda|qsv|d3d11va|dxva2|videotoolbox|
+        vulkan|drm|vdpau> (default auto). Valor inválido → exit 2 con mensaje
+        VISIBLE (se valida ANTES de silenciar stderr). --verbose imprime los
+        hwaccels compilados. HUD: "kitty+vaapi" vía DecoderHandle::hw_name(),
+        recalculado por frame (refleja el fallback mid-stream en vivo).
+    [x] Selección del decoder (decoder::open_video_decoder): intento hw sobre
+        contexto propio; si avcodec_open2 falla ese contexto es IRRECUPERABLE
+        → el camino software se construye siempre sobre un contexto nuevo.
+        Threading por camino: hw = Type::None/count 1 (decodifica la GPU);
+        sw = Type::Frame/count 0 (auto — crítico para AV1 4K).
 
-## Fase 2 — Integración en el pipeline de decode
+## Fase 2 — Integración en el pipeline de decode ✅ HECHA
 
-    [ ] decoder.rs: get_format callback para elegir el AV_PIX_FMT del hwaccel;
-        mantener thread_count=0 para el fallback software (los hwaccel no usan
-        frame threading — ajustar según camino activo).
-    [ ] decoder.rs: tras receive_frame, si frame.format() es hw → transfer a
-        frame NV12 en RAM (reutilizar buffer, no alocar por frame) y pasar ese
-        frame al Scaler; si es sw → camino actual sin cambios.
-    [ ] Scaler: aceptar NV12 como entrada (ya soporta cambio de in_fmt en
-        caliente, verificar que sws NV12→RGB24 elige el fast path SIMD).
-    [ ] Robustez: si el decode hw falla A MITAD de stream (reset de driver,
-        cambio de resolución mid-stream no soportado) → reabrir el decoder en
-        software desde el último keyframe, sin romper seriales ni el sync.
-    [ ] Verificar interacción con seeks (flush del decoder hw) y con el resize
-        (las dims destino no cambian el camino de decode, solo el sws de salida).
+    [x] get_format callback (en hwdec.rs) + threading según camino activo
+        (ver Fase 1).
+    [x] decoder.rs: tras receive_frame, si is_hw_frame → transfer_to_ram a
+        sw_frame (staging REUTILIZADO entre frames — av_frame_unref +
+        transfer lo reciclan, sin alocar por frame; av_frame_copy_props
+        preserva el PTS) y ese frame va al Scaler; camino sw sin cambios.
+    [x] Scaler: acepta NV12 sin cambios — ya reconstruye SwsCtx+rgb juntos
+        cuando cambia in_fmt en caliente; sws NV12→RGB24 usa fast path SIMD.
+    [x] Robustez mid-stream: dos disparadores — (a) transfer GPU→RAM falla,
+        (b) >30 errores CONSECUTIVOS de send_packet con hw activo. Acción:
+        reopen_software (contexto sw limpio) + seek al último PTS emitido +
+        drop_until (el MISMO aterrizaje exacto del refine-seek) — sin tocar
+        serials ni relojes: para el player es solo un decoder lento unos frames.
+        hw_state pasa a -1 → el HUD deja de mostrar "+vaapi" al instante.
+    [x] Seeks: decoder.flush() vale igual para hw (flush del ctx hw incluido);
+        resize: las dims destino solo afectan al sws de salida — verificado en
+        el smoke test (resize con hwdec activo no toca el camino de decode).
 
-## Fase 3 — Validación
+## Fase 3 — Validación 🔄 EN CURSO
 
-    [ ] Test de integración: reproducir con --hwdec auto y --hwdec none y
-        comparar sync-log (mismos umbrales de avdiff) + fps decode ≥ baseline.
-    [ ] Test de fallback: --hwdec vaapi en un entorno sin /dev/dri debe caer a
-        software con exit 0 y sin ensuciar el TUI (el sandbox de CI vale como
-        entorno negativo; el camino positivo requiere GPU real).
-    [ ] Test de estrés: seeks en ráfaga + tormenta de resizes con hwdec activo
-        (reusar integration_resize.py e integration_sync.py parametrizados).
-    [ ] Medir y documentar en el README: CPU% y fps con/sin hwdec en al menos
-        una máquina con GPU real (fuera del sandbox).
-    [ ] Actualizar README (matriz de soporte por SO/GPU/codec) y BUILD-WINDOWS.md
-        (D3D11VA no necesita libs extra; VAAPI necesita libva-dev en build).
+    [x] Smoke test manual (pty, sandbox SIN /dev/dri — entorno negativo
+        perfecto): --hwdec auto, none y vaapi → los tres reproducen 101
+        frames en 6 s y salen con exit 0; auto/vaapi caen a software sin
+        ensuciar el TUI. --hwdec badvalue → exit 2 con mensaje visible.
+    [ ] tests/integration_hwdec.py: --hwdec auto vs none comparando sync-log
+        (mismos umbrales de avdiff) + fallback exit 0 + CLI inválida exit 2.
+    [ ] Regresión: integration_resize.py e integration_sync.py sobre el build
+        con hwdec (default auto) sin degradación.
+    [ ] Medir y documentar en el README: CPU% y fps con/sin hwdec en una
+        máquina con GPU real (fuera del sandbox — documentar como pendiente).
+    [ ] Actualizar README (--hwdec + matriz de soporte SO/GPU/codec) y
+        BUILD-WINDOWS.md (D3D11VA sin libs extra; VAAPI necesita libva-dev).
 
 Riesgos conocidos:
     * ffmpeg-the-third puede no exponer get_format de forma segura → unsafe
