@@ -188,7 +188,7 @@ Unit tests                               —               8/8 PASS        —
 
 ---
 
-# Tarea 4 (EN CURSO — Fases 0-2 hechas, Fase 3 validación a medias): decode por hardware (VAAPI / D3D11VA / VideoToolbox)
+# Tarea 4 (HECHA — salvo medición con GPU real): decode por hardware (VAAPI / D3D11VA / VideoToolbox)
 
 Objetivo: descargar el decode de vídeo a la GPU cuando exista un hwaccel
 disponible, con fallback transparente a software. Caso motivador: AV1/HEVC 4K,
@@ -267,20 +267,31 @@ que hoy satura los cores en decode software y limita fps/resolución de render.
         resize: las dims destino solo afectan al sws de salida — verificado en
         el smoke test (resize con hwdec activo no toca el camino de decode).
 
-## Fase 3 — Validación 🔄 EN CURSO
+## Fase 3 — Validación ✅ HECHA (salvo GPU real)
 
     [x] Smoke test manual (pty, sandbox SIN /dev/dri — entorno negativo
-        perfecto): --hwdec auto, none y vaapi → los tres reproducen 101
+        perfecto): --hwdec auto, none y vaapi → los tres reproducen ~100
         frames en 6 s y salen con exit 0; auto/vaapi caen a software sin
         ensuciar el TUI. --hwdec badvalue → exit 2 con mensaje visible.
-    [ ] tests/integration_hwdec.py: --hwdec auto vs none comparando sync-log
-        (mismos umbrales de avdiff) + fallback exit 0 + CLI inválida exit 2.
-    [ ] Regresión: integration_resize.py e integration_sync.py sobre el build
-        con hwdec (default auto) sin degradación.
-    [ ] Medir y documentar en el README: CPU% y fps con/sin hwdec en una
-        máquina con GPU real (fuera del sandbox — documentar como pendiente).
-    [ ] Actualizar README (--hwdec + matriz de soporte SO/GPU/codec) y
-        BUILD-WINDOWS.md (D3D11VA sin libs extra; VAAPI necesita libva-dev).
+    [x] tests/integration_hwdec.py (nuevo): --hwdec auto/none/vaapi en pty
+        → exit 0, ≥40 frames, |avdiff| mediano < 120 ms (mismo umbral que
+        integration_sync.py), nº de frames comparable entre modos (±40% —
+        detecta un fallback que "reproduce" a 2 fps), y CLI inválida →
+        exit 2 con mensaje. PASA: 94/100/104 frames, avdiff ~1 ms.
+    [x] Regresión sobre el build con hwdec (default auto):
+        integration_sync.py OK (postseek |avdiff| ~1 ms), integration_resize.py
+        OK (25.5 fps post-tormenta, sync 1.0 ms), integration_grow_quality.py
+        OK (recuperación 765 ms, sync 1.8 ms), integration_resize_ux.py OK.
+    [x] README actualizado: --hwdec en la tabla de opciones, sección
+        "Decode por hardware" con matriz SO/orden de prueba/notas + soporte
+        AV1 por generación de GPU + nota de copy-back; hwdec.rs y los tests
+        nuevos en la estructura del repo; hoja de ruta actualizada.
+    [x] BUILD-WINDOWS.md: sección "Decode por hardware en Windows"
+        (D3D11VA/DXVA2 sin libs extra — BtbN las trae; en Linux VAAPI
+        necesita libva-dev solo si compilas FFmpeg tú mismo).
+    [ ] PENDIENTE (fuera del sandbox): medir CPU% y fps con/sin hwdec en
+        una máquina con GPU real — documentado como pendiente en el README.
+        El sandbox de CI no tiene /dev/dri: solo valida el camino negativo.
 
 Riesgos conocidos:
     * ffmpeg-the-third puede no exponer get_format de forma segura → unsafe

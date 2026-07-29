@@ -113,7 +113,41 @@ rtv <fichero> [opciones]
 | `--loop-video` | Reinicia al llegar al final |
 | `--stats` | FPS mostrados/decodificados y drops en el HUD |
 | `--no-audio` | Sin audio; el vídeo usa reloj monotónico |
-| `--verbose` | Deja los logs de FFmpeg en stderr (debugging) |
+| `--hwdec <auto\|none\|vaapi\|cuda\|qsv\|d3d11va\|dxva2\|videotoolbox\|vulkan\|drm\|vdpau>` | Decode por hardware. `auto` (default) prueba los hwaccels de la plataforma y cae a software si ninguno funciona; `none` fuerza software |
+| `--verbose` | Deja los logs de FFmpeg en stderr (debugging) y lista los hwaccels compilados |
+
+### Decode por hardware (`--hwdec`)
+
+Con `--hwdec auto` (el default) rtv intenta descargar el decode a la GPU
+y cae a software de forma transparente si no hay hwaccel utilizable
+(sin GPU, headless, codec no soportado por el driver…). El HUD muestra
+el hwaccel activo junto al backend (p.ej. `kitty+vaapi`); si el hwaccel
+muere a mitad de reproducción (reset de driver), rtv reabre el decoder
+en software desde el punto exacto de reproducción sin cortar audio ni
+sync, y la etiqueta del HUD vuelve a mostrar solo el backend.
+
+Los frames decodificados en GPU se copian a RAM (`av_hwframe_transfer_data`
+→ NV12) porque el sink es un terminal: las celdas se generan en CPU sí o
+sí. El ahorro está en el decode (la parte cara de AV1/HEVC 4K), no en el
+escalado.
+
+Matriz de soporte orientativa (depende del FFmpeg enlazado y del driver):
+
+| SO | Orden de prueba en `auto` | Notas |
+|---|---|---|
+| Linux | VAAPI → CUDA/NVDEC → QSV → VDPAU → Vulkan → DRM | VAAPI cubre Intel y AMD (Mesa); necesita acceso a `/dev/dri` |
+| Windows | D3D11VA → DXVA2 → CUDA → QSV → Vulkan | D3D11VA funciona sin libs extra en cualquier GPU moderna |
+| macOS | VideoToolbox | Apple Silicon e Intel |
+
+Por codec: H.264/HEVC están soportados por prácticamente cualquier GPU de
+la última década; **AV1** solo por GPUs recientes (Intel Xe/Arc, AMD
+RDNA2+, NVIDIA RTX 30+). El fallback es por negociación, no global: si el
+decoder AV1 no anuncia el hwaccel, ese vídeo va por software aunque otro
+H.264 en la misma máquina vaya por GPU.
+
+> Nota: la ganancia con GPU real (CPU%/fps con y sin `--hwdec`) está
+> pendiente de medir fuera del sandbox de CI (que no tiene `/dev/dri`;
+> ahí solo se valida el camino de fallback).
 
 ### Controles
 
@@ -188,6 +222,7 @@ rtv/
 │   ├── main.rs              # CLI, init de FFmpeg, silenciado de logs
 │   ├── player.rs            # loop principal y sync
 │   ├── decoder.rs           # hilo de vídeo
+│   ├── hwdec.rs             # decode por hardware (unsafe FFmpeg aislado)
 │   ├── audio.rs             # hilo de audio + sink cpal
 │   ├── clock.rs             # relojes ffplay-style
 │   ├── renderer.rs          # backends de render + HUD
@@ -196,7 +231,9 @@ rtv/
 └── tests/
     ├── integration_sync.py       # sync A/V + seeks, en pty real
     ├── integration_resize.py     # tormenta de resizes + seeks + pausa
-    └── integration_resize_ux.py  # latencia de resize, parpadeo, límites
+    ├── integration_resize_ux.py  # latencia de resize, parpadeo, límites
+    ├── integration_grow_quality.py # recuperación de calidad al agrandar
+    └── integration_hwdec.py      # --hwdec: fallback transparente y CLI
 ```
 
 ## Tests
@@ -211,6 +248,8 @@ cargo build --release
 python3 tests/integration_sync.py       video.mp4
 python3 tests/integration_resize.py     video.mp4 [ascii|blocks]
 python3 tests/integration_resize_ux.py  video.mp4
+python3 tests/integration_grow_quality.py video.mp4
+python3 tests/integration_hwdec.py      video.mp4
 ```
 
 Verifican, entre otras cosas: |avdiff| en régimen y tras cada seek, latencia
@@ -229,11 +268,14 @@ Hecho:
 - [x] Escalado adaptativo por tamaño real de celda
 - [x] Resize en caliente instantáneo, sin perder sync ni colchón de decode
 - [x] HUD adaptativo sin parpadeo; oculto en ventanas minúsculas
+- [x] Decode por hardware (`--hwdec`): VAAPI/CUDA/QSV (Linux),
+      D3D11VA/DXVA2 (Windows), VideoToolbox (macOS), con fallback
+      transparente a software incluso a mitad de stream
 
 Pendiente:
 
-- [ ] **Decode por hardware**: VAAPI (Linux), D3D11VA (Windows),
-      VideoToolbox (macOS) — plan detallado en [`todo.md`](todo.md)
+- [ ] Medir la ganancia de `--hwdec` en una máquina con GPU real
+      (el sandbox de CI no tiene `/dev/dri`)
 - [ ] Sixel real para xterm/mlterm
 - [ ] Protocolo iTerm2 nativo (`ESC ] 1337 ; File=`)
 - [ ] Subtítulos softsub (SRT/ASS)

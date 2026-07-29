@@ -131,6 +131,19 @@ cargo build --release
 `vcpkg install` compila FFmpeg desde cero → tarda **20-40 minutos**. Por eso
 recomiendo BtbN.
 
+## Decode por hardware en Windows
+
+`--hwdec auto` prueba **D3D11VA → DXVA2 → CUDA → QSV → Vulkan**. Buenas
+noticias: **D3D11VA y DXVA2 no necesitan ninguna librería extra** — van
+contra las API de Windows que ya están en el sistema, y los builds de BtbN
+las traen habilitadas. Con cualquier GPU moderna (Intel/AMD/NVIDIA) el
+decode de H.264/HEVC debería salir por GPU sin hacer nada; AV1 solo con
+GPUs recientes (Intel Arc, AMD RDNA2+, NVIDIA RTX 30+).
+
+En Linux, en cambio, VAAPI requiere `libva-dev` (y drivers Mesa/iHD) en
+la máquina de build si compilas FFmpeg tú mismo; con el FFmpeg del sistema
+(`libavcodec-dev` de la distro) ya viene incluido.
+
 ## Terminal recomendado
 
 | Terminal | Compatible | Notas |
