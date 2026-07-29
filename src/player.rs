@@ -44,6 +44,7 @@ pub struct Config {
     pub loop_video: bool,
     pub show_stats: bool,
     pub no_audio: bool,
+    pub hw_pref: crate::hwdec::HwPref,
 }
 
 struct TerminalGuard {
@@ -146,7 +147,17 @@ pub fn run(cfg: Config) -> Result<()> {
     let mut hud_lines = hud_rows_for(cols, rows);
     let (dst_w0, dst_h0) =
         terminfo::adaptive_target_pixels(backend, cols, rows, cell_px, cfg.scale, hud_lines);
-    let dec = decoder::spawn(&cfg.path, dst_w0, dst_h0)?;
+    let dec = decoder::spawn(&cfg.path, dst_w0, dst_h0, cfg.hw_pref)?;
+
+    // Etiqueta del HUD: "kitty" (sw) o "kitty+vaapi" (decode HW).
+    // Se recalcula en cada frame porque el fallback mid-stream puede
+    // cambiar hw→sw en caliente (DecoderHandle::hw_state atómico).
+    let hud_backend_label = |dec: &decoder::DecoderHandle, base: &str| -> String {
+        match dec.hw_name() {
+            Some(hw) => format!("{base}+{hw}"),
+            None => base.to_string(),
+        }
+    };
 
     let (mut dst_w, mut dst_h, _, _) = compute_layout(
         backend,
@@ -512,7 +523,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 &*master,
                 dec.duration,
                 volume,
-                backend.name(),
+                &hud_backend_label(&dec, backend.name()),
                 cell_px,
                 dst_w,
                 dst_h,
@@ -657,7 +668,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 &*master,
                 dec.duration,
                 volume,
-                backend.name(),
+                &hud_backend_label(&dec, backend.name()),
                 cell_px,
                 dst_w,
                 dst_h,
@@ -811,7 +822,7 @@ pub fn run(cfg: Config) -> Result<()> {
             &*master,
             dec.duration,
             volume,
-            backend.name(),
+            &hud_backend_label(&dec, backend.name()),
             cell_px,
             dst_w,
             dst_h,

@@ -45,6 +45,7 @@
 //!     redimensionar). En error el Scaler se resetea a `None` y se
 //!     reconstruye limpio en la siguiente llamada — nunca queda roto.
 
+use crate::hwdec::{self, ActiveHw, HwPref};
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use ffmpeg_the_third as ffmpeg;
@@ -174,6 +175,10 @@ pub struct DecoderHandle {
     /// Frames por segundo estimados del stream (avg_frame_rate).
     pub fps: f64,
     pub eof: Arc<AtomicBool>,
+    /// Estado del hwaccel: valor crudo de AVHWDeviceType si hay decode
+    /// HW activo, o -1 si software (incluye el fallback mid-stream).
+    /// El player lo lee en cada frame para la etiqueta del HUD.
+    pub hw_state: Arc<AtomicI32>,
     seek_tx: Sender<SeekReq>,
     /// Dims destino (w<<32|h) que el decoder lee ANTES de escalar
     /// cada frame. `resize()` es un store atómico: coalescencia
@@ -252,6 +257,12 @@ impl DecoderHandle {
             .store(pack_dims(w.max(2), h.max(2)), Ordering::Release);
     }
 
+    /// Nombre del hwaccel activo ("vaapi", "cuda"…) o None si el
+    /// decode es por software. Refleja fallbacks mid-stream en vivo.
+    pub fn hw_name(&self) -> Option<&'static str> {
+        hwdec::name_of_raw(self.hw_state.load(Ordering::Acquire))
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         while self.rx.try_recv().is_ok() {}
@@ -267,7 +278,12 @@ impl Drop for DecoderHandle {
     }
 }
 
-pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderHandle> {
+pub fn spawn<P: AsRef<Path>>(
+    path: P,
+    dst_w: u32,
+    dst_h: u32,
+    hw_pref: HwPref,
+) -> Result<DecoderHandle> {
     let path = path.as_ref().to_owned();
     let ictx = input(&path).with_context(|| format!("abriendo {:?}", path))?;
 
@@ -292,19 +308,7 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
         30.0
     };
 
-    let codec_params = stream.parameters();
-    let mut dec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)?;
-    // Decode multi-hilo (auto = nº de cores). Crítico para AV1/HEVC
-    // 4K por software: con 1 hilo el decode no llega a realtime y
-    // además roba CPU al hilo de audio (underruns → saltos de reloj).
-    {
-        let mut tc = ffmpeg::codec::threading::Config::kind(
-            ffmpeg::codec::threading::Type::Frame,
-        );
-        tc.count = 0; // 0 = auto (todos los cores)
-        dec_ctx.set_threading(tc);
-    }
-    let decoder = dec_ctx.decoder().video()?;
+    let (decoder, active_hw) = open_video_decoder(&stream, hw_pref)?;
 
     let src_w = decoder.width();
     let src_h = decoder.height();
@@ -325,11 +329,18 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
     let stop = Arc::new(AtomicBool::new(false));
     let eof = Arc::new(AtomicBool::new(false));
     let serial = Arc::new(AtomicI32::new(0));
+    let hw_state = Arc::new(AtomicI32::new(
+        active_hw
+            .as_ref()
+            .map(|h| h.device_type.0 as i32)
+            .unwrap_or(-1),
+    ));
 
     let stop_th = stop.clone();
     let eof_th = eof.clone();
     let serial_th = serial.clone();
     let target_dims_th = target_dims.clone();
+    let hw_state_th = hw_state.clone();
 
     let join = thread::Builder::new()
         .name("rtv-decoder".into())
@@ -338,6 +349,8 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
                 path,
                 video_stream_index,
                 decoder,
+                active_hw,
+                hw_state_th,
                 tx,
                 seek_rx,
                 target_dims_th,
@@ -354,6 +367,7 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
         source_size: (src_w, src_h),
         fps,
         eof,
+        hw_state,
         seek_tx,
         target_dims,
         serial,
@@ -362,11 +376,87 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
     })
 }
 
+/// Abre el decoder de vídeo intentando hwaccel según `hw_pref`.
+///
+/// El intento HW usa un contexto propio: si `avcodec_open2` falla con
+/// el hwaccel enganchado, ese contexto queda IRRECUPERABLE (FFmpeg no
+/// permite reabrir un contexto fallido) → el camino software se
+/// construye SIEMPRE sobre un contexto nuevo y limpio.
+///
+/// Threading por camino:
+///   * HW: `Type::None`, count=1 — el trabajo pesado lo hace la GPU;
+///     el frame-threading de CPU no aplica y con algunos hwaccels
+///     añade latencia o directamente estorba.
+///   * SW: `Type::Frame`, count=0 (auto, todos los cores) — crítico
+///     para AV1/HEVC 4K por software (dav1d con 1 hilo no llega a
+///     realtime y roba CPU al audio → underruns).
+fn open_video_decoder(
+    stream: &ffmpeg::Stream,
+    hw_pref: HwPref,
+) -> Result<(ffmpeg::decoder::Video, Option<ActiveHw>)> {
+    // ── Intento HW ──────────────────────────────────────────────
+    if !matches!(hw_pref, HwPref::None) {
+        let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+        if let Some(codec) = ffmpeg::codec::decoder::find(ctx.id()) {
+            let mut dec = ctx.decoder();
+            let hw = unsafe { hwdec::try_enable(dec.as_mut_ptr(), codec.as_ptr(), hw_pref) };
+            if let Some(active) = hw {
+                let mut tc = ffmpeg::codec::threading::Config::kind(
+                    ffmpeg::codec::threading::Type::None,
+                );
+                tc.count = 1;
+                dec.set_threading(tc);
+                match dec.open_as(codec).and_then(|o| o.video()) {
+                    Ok(v) => return Ok((v, Some(active))),
+                    Err(_) => {
+                        // Contexto fallido no reutilizable → limpiar la
+                        // static del get_format y caer a software.
+                        hwdec::disable_expected_fmt();
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Camino software (contexto nuevo y limpio) ───────────────
+    let mut ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+    {
+        let mut tc = ffmpeg::codec::threading::Config::kind(
+            ffmpeg::codec::threading::Type::Frame,
+        );
+        tc.count = 0; // 0 = auto (todos los cores)
+        ctx.set_threading(tc);
+    }
+    Ok((ctx.decoder().video()?, None))
+}
+
+/// Reconstruye un decoder 100% software para `video_idx` (fallback
+/// mid-stream cuando el camino HW muere). `None` si ni siquiera el
+/// camino software se pudo abrir (stream corrupto/desaparecido).
+fn reopen_software(
+    ictx: &ffmpeg::format::context::Input,
+    video_idx: usize,
+) -> Option<ffmpeg::decoder::Video> {
+    let stream = ictx.stream(video_idx)?;
+    let mut ctx =
+        ffmpeg::codec::context::Context::from_parameters(stream.parameters()).ok()?;
+    {
+        let mut tc = ffmpeg::codec::threading::Config::kind(
+            ffmpeg::codec::threading::Type::Frame,
+        );
+        tc.count = 0;
+        ctx.set_threading(tc);
+    }
+    ctx.decoder().video().ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_loop(
     path: std::path::PathBuf,
     video_idx: usize,
     mut decoder: ffmpeg::decoder::Video,
+    mut hw: Option<ActiveHw>,
+    hw_state: Arc<AtomicI32>,
     tx: Sender<RgbFrame>,
     seek_rx: Receiver<SeekReq>,
     target_dims: Arc<AtomicU64>,
@@ -384,6 +474,17 @@ fn decode_loop(
 
     let mut scaler = Scaler::new();
     let mut frame = VideoFrame::empty();
+    // Frame de staging para el copy-back GPU→RAM (decode HW). Se
+    // reutiliza entre frames (av_frame_unref + transfer lo reciclan).
+    let mut sw_frame = VideoFrame::empty();
+    // Último PTS emitido: punto de reanudación del fallback hw→sw
+    // mid-stream (seek + drop_until, el mismo aterrizaje exacto que
+    // usa el refine-seek) — sin tocar serials ni relojes del player.
+    let mut last_emitted_pts: f64 = 0.0;
+    // Errores CONSECUTIVOS de send_packet con hw activo: si superan
+    // el umbral, el hwaccel está roto (driver caído, perfil no
+    // soportado a mitad de stream) → fallback a software.
+    let mut hw_pkt_errors: u32 = 0;
     // Serial que el hilo cree que está procesando ahora mismo. Cuando
     // recibe un SeekReq, actualiza current_serial.
     let mut current_serial: i32 = 0;
@@ -464,6 +565,8 @@ fn decode_loop(
                     &mut decoder,
                     &mut scaler,
                     &mut frame,
+                    &hw,
+                    &mut sw_frame,
                     &target_dims,
                     &tx,
                     &stop,
@@ -481,8 +584,16 @@ fn decode_loop(
             }
         };
 
-        let _ = decoder.send_packet(&pkt);
+        match decoder.send_packet(&pkt) {
+            Ok(()) => hw_pkt_errors = 0,
+            Err(_) => {
+                if hw.is_some() {
+                    hw_pkt_errors += 1;
+                }
+            }
+        }
 
+        let mut hw_transfer_failed = false;
         while decoder.receive_frame(&mut frame).is_ok() {
             if stop.load(Ordering::Relaxed) {
                 break 'outer;
@@ -505,18 +616,59 @@ fn decode_loop(
                 drop_until = None;
             }
 
+            // Copy-back GPU→RAM si el frame es una superficie HW
+            // (VAAPI/CUDA/…). El resultado (NV12 típicamente) sigue
+            // el pipeline normal: sws NV12→RGB24.
+            let src: &VideoFrame = match hw.as_ref() {
+                Some(h) if hwdec::is_hw_frame(&frame, h) => {
+                    if hwdec::transfer_to_ram(&frame, &mut sw_frame) {
+                        &sw_frame
+                    } else {
+                        hw_transfer_failed = true;
+                        break;
+                    }
+                }
+                _ => &frame,
+            };
+
             // Leer las dims destino MÁS RECIENTES justo antes de
             // escalar: el resize se aplica al mismísimo siguiente
             // frame (coalescencia atómica; el Scaler reconstruye si
             // cambia cualquier dimensión de entrada o de salida).
             let (dst_w, dst_h) = unpack_dims(target_dims.load(Ordering::Acquire));
-            let out = match scaler.scale(&frame, dst_w, dst_h) {
+            let out = match scaler.scale(src, dst_w, dst_h) {
                 Some(rgb) => build_rgb_frame(rgb, pts_secs, current_serial),
                 None => continue,
             };
+            last_emitted_pts = pts_secs;
             if send_with_stop(&tx, out, &stop, &serial_atomic, current_serial).is_err() {
                 break 'outer;
             }
+        }
+
+        // Fallback HW→SW mid-stream: (a) la transferencia GPU→RAM se
+        // rompió, o (b) ráfaga de errores de send_packet con hwaccel
+        // activo. Se reconstruye un decoder software limpio y se
+        // re-decodifica desde el último frame emitido (seek +
+        // drop_until — el mismo mecanismo de aterrizaje exacto del
+        // refine-seek) SIN tocar serials ni relojes: para el player
+        // es un decoder que tardó unos frames más de lo normal.
+        if hw.is_some() && (hw_transfer_failed || hw_pkt_errors > 30) {
+            hw = None;
+            hw_pkt_errors = 0;
+            hwdec::disable_expected_fmt();
+            hw_state.store(-1, Ordering::Release);
+            match reopen_software(&ictx, video_idx) {
+                Some(d) => {
+                    decoder = d;
+                    scaler = Scaler::new();
+                    let ts = (last_emitted_pts * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
+                    let _ = ictx.seek(ts, ..=ts);
+                    drop_until = Some(last_emitted_pts);
+                }
+                None => break 'outer,
+            }
+            continue 'outer;
         }
     }
 
@@ -582,6 +734,8 @@ fn drain(
     decoder: &mut ffmpeg::decoder::Video,
     scaler: &mut Scaler,
     frame: &mut VideoFrame,
+    hw: &Option<ActiveHw>,
+    sw_frame: &mut VideoFrame,
     target_dims: &Arc<AtomicU64>,
     tx: &Sender<RgbFrame>,
     stop: &Arc<AtomicBool>,
@@ -606,8 +760,21 @@ fn drain(
             }
             *drop_until = None;
         }
+        // Copy-back GPU→RAM también en el flush final. Si la
+        // transferencia falla aquí no hay recuperación posible (es el
+        // drain de EOF): se descarta el frame y se sigue.
+        let src: &VideoFrame = match hw.as_ref() {
+            Some(h) if hwdec::is_hw_frame(frame, h) => {
+                if hwdec::transfer_to_ram(frame, sw_frame) {
+                    &*sw_frame
+                } else {
+                    continue;
+                }
+            }
+            _ => &*frame,
+        };
         let (dst_w, dst_h) = unpack_dims(target_dims.load(Ordering::Acquire));
-        let out = match scaler.scale(frame, dst_w, dst_h) {
+        let out = match scaler.scale(src, dst_w, dst_h) {
             Some(rgb) => build_rgb_frame(rgb, pts_secs, current_serial),
             None => continue,
         };
