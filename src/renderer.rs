@@ -163,6 +163,10 @@ impl Renderer {
     /// `max_rows` celdas (el área del terminal sin el HUD). Tolera
     /// frames con dims que no cuadran con el layout actual (resize en
     /// vuelo): se pintan recortados en vez de desbordar la pantalla.
+    ///
+    /// Devuelve `true` si emitió un clear de pantalla completo (2J) —
+    /// el caller debe invalidar su caché de HUD porque la fila del
+    /// HUD también fue borrada.
     pub fn draw<W: Write>(
         &mut self,
         out: &mut W,
@@ -171,9 +175,9 @@ impl Renderer {
         max_rows: u16,
         col_ox: u16,
         row_oy: u16,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if max_cols == 0 || max_rows == 0 || frame.width == 0 || frame.height == 0 {
-            return Ok(());
+            return Ok(false);
         }
         // Offsets clampeados al área útil.
         let col_ox = col_ox.min(max_cols.saturating_sub(1));
@@ -187,20 +191,23 @@ impl Renderer {
             col_ox as u32,
             row_oy as u32,
         );
+        let mut cleared = false;
         if self.last_layout != Some(layout) {
             self.scratch.clear();
             self.scratch.extend_from_slice(b"\x1b[2J\x1b[H");
             out.write_all(&self.scratch)?;
             self.last_layout = Some(layout);
+            cleared = true;
         }
 
         match self.backend {
-            Backend::Kitty => self.draw_kitty(out, frame, max_cols, max_rows, col_ox, row_oy),
+            Backend::Kitty => self.draw_kitty(out, frame, max_cols, max_rows, col_ox, row_oy)?,
             Backend::HalfBlocks | Backend::Iterm2 | Backend::Sixel => {
-                self.draw_halfblocks(out, frame, max_cols, max_rows, col_ox, row_oy)
+                self.draw_halfblocks(out, frame, max_cols, max_rows, col_ox, row_oy)?
             }
-            Backend::Ascii => self.draw_ascii(out, frame, max_cols, max_rows, col_ox, row_oy),
+            Backend::Ascii => self.draw_ascii(out, frame, max_cols, max_rows, col_ox, row_oy)?,
         }
+        Ok(cleared)
     }
 
     fn draw_halfblocks<W: Write>(
@@ -388,21 +395,27 @@ impl Renderer {
 /// El caller elige cuántas filas reservar (`reserve_rows`); si es 2, la primera
 /// es una barra de progreso "grande" con detalles y la segunda es la línea de
 /// atajos de teclado.
-/// Escribe UNA línea del HUD en la fila `row` (1-indexed). Antes de escribir,
-/// resetea SGR + limpia la fila entera + reposiciona cursor a col 1 de la
-/// fila. La línea se trunca a `cols` caracteres visibles y se rellena con
-/// espacios normales para tapar cualquier resto del frame anterior.
+/// Escribe UNA línea del HUD en la fila `row` (1-indexed).
+///
+/// v0.7 — anti-parpadeo y anti-basura:
+///   * El truncado y el padding se calculan por ANCHURA REAL en celdas
+///     (unicode-width): los emojis del HUD (🔊, 🔇…) ocupan 2 celdas y
+///     con el conteo por caracteres la línea desbordaba `cols` en la
+///     ÚLTIMA fila → autowrap → scroll de TODA la pantalla → el frame
+///     subía una línea, el siguiente frame repintaba… parpadeo masivo y
+///     "texto basura por los lados" en terminales pequeñas.
+///   * Sin `\x1b[2K`: borrar la fila y reescribirla produce flicker en
+///     terminales lentas. El padding hasta `cols` ya cubre la fila
+///     entera, así que la escritura es idéntica visualmente pero
+///     atómica (sin estado intermedio en blanco).
 pub fn draw_hud_at(out: &mut StdoutLock, cols: u16, row: u16, line: &str) -> Result<()> {
-    let content = truncate_to_cells(line, cols as usize);
-    let content_chars = content.chars().count();
-    // Rellenamos manualmente con espacios hasta `cols` para no depender del
-    // pad con formato (que cuenta bytes, no caracteres visibles).
-    let pad_needed = cols as usize - content_chars.min(cols as usize);
-    // Secuencia: reset SGR → mover cursor → borrar fila → texto → padding → reset.
+    let (content, content_width) = truncate_to_width(line, cols as usize);
+    let pad_needed = (cols as usize).saturating_sub(content_width);
+    // Secuencia: reset SGR → mover cursor → texto → padding → reset.
     // El reset final evita que un color "colgado" contamine el frame siguiente.
     write!(
         out,
-        "\x1b[0m\x1b[{};1H\x1b[2K{}{}\x1b[0m",
+        "\x1b[0m\x1b[{};1H{}{}\x1b[0m",
         row,
         content,
         " ".repeat(pad_needed),
@@ -428,20 +441,21 @@ pub fn draw_hud_two_lines(
     Ok(())
 }
 
-/// Trunca por número de CARACTERES visibles (no bytes) — importante para
-/// evitar romper secuencias UTF-8 y sobredibujar líneas cuando el HUD tiene
-/// caracteres multibyte (█, ░, ▶, ⏸, ·).
-fn truncate_to_cells(s: &str, max_chars: usize) -> String {
+/// Trunca por ANCHURA REAL en celdas (unicode-width, no chars ni bytes) y
+/// devuelve también la anchura resultante. Crítico para el HUD: 🔊/🔇 son
+/// wide (2 celdas) y █/░/▶/⏸/· son 1; contar "1 celda por char" hacía que
+/// la línea real desbordara `cols` → autowrap+scroll en la última fila.
+fn truncate_to_width(s: &str, max_width: usize) -> (String, usize) {
+    use unicode_width::UnicodeWidthChar;
     let mut out = String::with_capacity(s.len());
-    let mut count = 0usize;
+    let mut width = 0usize;
     for c in s.chars() {
-        if count >= max_chars {
+        let cw = c.width().unwrap_or(0);
+        if width + cw > max_width {
             break;
         }
         out.push(c);
-        // Aproximación: consideramos que estos caracteres ocupan 1 celda.
-        // No manejamos wide chars (CJK) porque el HUD es ASCII-latino.
-        count += 1;
+        width += cw;
     }
-    out
+    (out, width)
 }

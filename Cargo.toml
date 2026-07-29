@@ -31,6 +31,10 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 once_cell = "1"
+# Anchura REAL en celdas de cada carácter (wide/emoji) — el HUD se
+# truncaba contando 1 celda/char y con caracteres de anchura 2 la
+# línea desbordaba `cols` → autowrap → scroll → basura visual.
+unicode-width = "0.2"
 
 # --- Allocator rápido ---
 mimalloc = { version = "0.1", default-features = false }
