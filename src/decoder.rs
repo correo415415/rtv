@@ -25,6 +25,25 @@
 //!
 //!   * Ya no marcamos `last_pts_ms` — el reloj lo lleva el player
 //!     desde `vidclk.set_pts` en cada frame renderizado.
+//!
+//! v0.6 — resize robusto y súper dinámico:
+//!
+//!   * **`target_dims` como `AtomicU64`** (w<<32|h): `resize()` es un
+//!     store atómico — sin canal, sin drenar la cola de frames
+//!     pre-decodificados (que costaba ~2.5 s de colchón en cada
+//!     evento de resize → stalls), y con coalescencia gratis en
+//!     tormentas de resize (el decoder siempre lee el ÚLTIMO valor).
+//!
+//!   * **`struct Scaler`**: encapsula `SwsCtx` + frame RGB de salida
+//!     y los reconstruye JUNTOS cuando cualquier dimensión/formato
+//!     cambia. `SwsCtx::run()` de ffmpeg-the-third dimensiona el
+//!     frame de salida UNA sola vez (cuando está vacío) y después
+//!     exige que coincida con el contexto: el código viejo recreaba
+//!     el contexto pero REUTILIZABA el frame viejo →
+//!     `Error::OutputChanged` en todos los `run()` posteriores → el
+//!     decoder dejaba de emitir para siempre ("crashea todo" al
+//!     redimensionar). En error el Scaler se resetea a `None` y se
+//!     reconstruye limpio en la siguiente llamada — nunca queda roto.
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
@@ -34,10 +53,107 @@ use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as SwsCtx, flag::Flags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// Empaqueta (w, h) en un u64 para el store/load atómico de resize.
+#[inline]
+fn pack_dims(w: u32, h: u32) -> u64 {
+    (u64::from(w) << 32) | u64::from(h)
+}
+
+/// Desempaqueta el u64 atómico a (w, h), con mínimo de 2×2 para no
+/// pasarle jamás dims degeneradas (0/1) a sws_scale.
+#[inline]
+fn unpack_dims(v: u64) -> (u32, u32) {
+    (((v >> 32) as u32).max(2), ((v & 0xFFFF_FFFF) as u32).max(2))
+}
+
+/// Escalador robusto: mantiene el `SwsCtx` Y el frame RGB de salida
+/// como una unidad. Si cambian las dims de entrada (mid-stream) o de
+/// salida (resize de la terminal), reconstruye AMBOS a la vez — el
+/// frame de salida nuevo (vacío) se dimensiona en el primer `run()`
+/// con las dims del contexto nuevo, evitando `Error::OutputChanged`.
+/// Si `SwsCtx::get`/`run` fallan, queda en `None` y se reintenta en
+/// la siguiente llamada: nunca envenena el loop de decode.
+struct Scaler {
+    sws: Option<SwsCtx>,
+    rgb: VideoFrame,
+    in_w: u32,
+    in_h: u32,
+    in_fmt: Pixel,
+    out_w: u32,
+    out_h: u32,
+}
+
+impl Scaler {
+    fn new() -> Self {
+        Self {
+            sws: None,
+            rgb: VideoFrame::empty(),
+            in_w: 0,
+            in_h: 0,
+            in_fmt: Pixel::None,
+            out_w: 0,
+            out_h: 0,
+        }
+    }
+
+    /// Escala `frame` a `dst_w`×`dst_h` RGB24. Devuelve `Some(&rgb)`
+    /// o `None` si la conversión no fue posible (se reintentará con
+    /// un contexto fresco en la próxima llamada).
+    fn scale(&mut self, frame: &VideoFrame, dst_w: u32, dst_h: u32) -> Option<&VideoFrame> {
+        let iw = frame.width();
+        let ih = frame.height();
+        let ifmt = frame.format();
+        if iw == 0 || ih == 0 || ifmt == Pixel::None {
+            return None;
+        }
+        let dw = dst_w.max(2);
+        let dh = dst_h.max(2);
+
+        let needs_rebuild = self.sws.is_none()
+            || iw != self.in_w
+            || ih != self.in_h
+            || ifmt != self.in_fmt
+            || dw != self.out_w
+            || dh != self.out_h;
+
+        if needs_rebuild {
+            match SwsCtx::get(ifmt, iw, ih, Pixel::RGB24, dw, dh, Flags::FAST_BILINEAR) {
+                Ok(ctx) => {
+                    self.sws = Some(ctx);
+                    // CRÍTICO: frame de salida NUEVO junto al contexto
+                    // nuevo. Reutilizar el viejo (ya dimensionado a las
+                    // dims anteriores) provoca Error::OutputChanged en
+                    // todos los run() posteriores.
+                    self.rgb = VideoFrame::empty();
+                    self.in_w = iw;
+                    self.in_h = ih;
+                    self.in_fmt = ifmt;
+                    self.out_w = dw;
+                    self.out_h = dh;
+                }
+                Err(_) => {
+                    self.sws = None;
+                    return None;
+                }
+            }
+        }
+
+        match self.sws.as_mut()?.run(frame, &mut self.rgb) {
+            Ok(()) => Some(&self.rgb),
+            Err(_) => {
+                // Estado potencialmente inconsistente → resetear TODO;
+                // la próxima llamada reconstruye limpio.
+                self.sws = None;
+                None
+            }
+        }
+    }
+}
 
 /// Un frame RGB24 listo para renderizar. `width` y `height` son
 /// en píxeles (no en columnas/filas). PTS en segundos. `serial` es
@@ -59,7 +175,10 @@ pub struct DecoderHandle {
     pub fps: f64,
     pub eof: Arc<AtomicBool>,
     seek_tx: Sender<SeekReq>,
-    resize_tx: Sender<(u32, u32)>,
+    /// Dims destino (w<<32|h) que el decoder lee ANTES de escalar
+    /// cada frame. `resize()` es un store atómico: coalescencia
+    /// automática en tormentas de resize y cero pérdida de eventos.
+    target_dims: Arc<AtomicU64>,
     /// Serial del decoder de vídeo. Se incrementa en cada seek.
     /// El player lo lee para saber qué frames son válidos.
     pub serial: Arc<AtomicI32>,
@@ -94,9 +213,14 @@ impl DecoderHandle {
         self.serial.load(Ordering::Acquire)
     }
 
+    /// Cambia las dims destino del escalado. Lock-free e instantáneo:
+    /// NO drena la cola de frames pre-decodificados (el colchón de
+    /// ~2.5 s se conserva — los frames "viejos" llevan sus propias
+    /// dims y el renderer los recorta), y NO usa canal (una tormenta
+    /// de resizes colapsa en el último valor automáticamente).
     pub fn resize(&self, w: u32, h: u32) {
-        while self.rx.try_recv().is_ok() {}
-        let _ = self.resize_tx.try_send((w, h));
+        self.target_dims
+            .store(pack_dims(w.max(2), h.max(2)), Ordering::Release);
     }
 
     pub fn stop(&mut self) {
@@ -155,7 +279,6 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
 
     let src_w = decoder.width();
     let src_h = decoder.height();
-    let src_fmt = decoder.format();
 
     // Cola de pre-decode adaptativa por PRESUPUESTO DE MEMORIA
     // (~48 MB): con frames pequeños (ascii/halfblocks) caben 64 →
@@ -169,7 +292,7 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
     let cap = (48 * 1024 * 1024 / frame_bytes.max(1)).clamp(4, 64);
     let (tx, rx) = bounded::<RgbFrame>(cap);
     let (seek_tx, seek_rx) = unbounded::<SeekReq>();
-    let (resize_tx, resize_rx) = bounded::<(u32, u32)>(4);
+    let target_dims = Arc::new(AtomicU64::new(pack_dims(dst_w.max(2), dst_h.max(2))));
     let stop = Arc::new(AtomicBool::new(false));
     let eof = Arc::new(AtomicBool::new(false));
     let serial = Arc::new(AtomicI32::new(0));
@@ -177,6 +300,7 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
     let stop_th = stop.clone();
     let eof_th = eof.clone();
     let serial_th = serial.clone();
+    let target_dims_th = target_dims.clone();
 
     let join = thread::Builder::new()
         .name("rtv-decoder".into())
@@ -185,14 +309,9 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
                 path,
                 video_stream_index,
                 decoder,
-                src_w,
-                src_h,
-                src_fmt,
-                dst_w,
-                dst_h,
                 tx,
                 seek_rx,
-                resize_rx,
+                target_dims_th,
                 stop_th,
                 eof_th.clone(),
                 serial_th,
@@ -207,7 +326,7 @@ pub fn spawn<P: AsRef<Path>>(path: P, dst_w: u32, dst_h: u32) -> Result<DecoderH
         fps,
         eof,
         seek_tx,
-        resize_tx,
+        target_dims,
         serial,
         stop,
         join: Some(join),
@@ -219,14 +338,9 @@ fn decode_loop(
     path: std::path::PathBuf,
     video_idx: usize,
     mut decoder: ffmpeg::decoder::Video,
-    src_w: u32,
-    src_h: u32,
-    src_fmt: Pixel,
-    dst_w0: u32,
-    dst_h0: u32,
     tx: Sender<RgbFrame>,
     seek_rx: Receiver<SeekReq>,
-    resize_rx: Receiver<(u32, u32)>,
+    target_dims: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     eof: Arc<AtomicBool>,
     serial_atomic: Arc<AtomicI32>,
@@ -239,27 +353,8 @@ fn decode_loop(
     let tb_num = f64::from(time_base.numerator());
     let tb_den = f64::from(time_base.denominator());
 
-    let mut dst_w = dst_w0.max(2);
-    let mut dst_h = dst_h0.max(2);
-
-    let mut sws = match SwsCtx::get(
-        src_fmt,
-        src_w,
-        src_h,
-        Pixel::RGB24,
-        dst_w,
-        dst_h,
-        Flags::FAST_BILINEAR,
-    ) {
-        Ok(c) => c,
-        Err(_) => {
-            eof.store(true, Ordering::Relaxed);
-            return Ok(());
-        }
-    };
-
+    let mut scaler = Scaler::new();
     let mut frame = VideoFrame::empty();
-    let mut rgb = VideoFrame::empty();
     // Serial que el hilo cree que está procesando ahora mismo. Cuando
     // recibe un SeekReq, actualiza current_serial.
     let mut current_serial: i32 = 0;
@@ -317,22 +412,6 @@ fn decode_loop(
             continue;
         }
 
-        while let Ok((w, h)) = resize_rx.try_recv() {
-            dst_w = w.max(2);
-            dst_h = h.max(2);
-            if let Ok(new_sws) = SwsCtx::get(
-                src_fmt,
-                src_w,
-                src_h,
-                Pixel::RGB24,
-                dst_w,
-                dst_h,
-                Flags::FAST_BILINEAR,
-            ) {
-                sws = new_sws;
-            }
-        }
-
         let pkt = match ictx.packets().next() {
             Some(Ok((s, p))) => {
                 if s.index() != video_idx {
@@ -345,9 +424,9 @@ fn decode_loop(
                 let _ = decoder.send_eof();
                 drain(
                     &mut decoder,
-                    &mut sws,
+                    &mut scaler,
                     &mut frame,
-                    &mut rgb,
+                    &target_dims,
                     &tx,
                     &stop,
                     tb_num,
@@ -378,24 +457,15 @@ fn decode_loop(
             let pts_ticks = frame.pts().unwrap_or(0);
             let pts_secs = pts_ticks as f64 * tb_num / tb_den;
 
-            if frame.width() != src_w || frame.height() != src_h {
-                if let Ok(new_sws) = SwsCtx::get(
-                    frame.format(),
-                    frame.width(),
-                    frame.height(),
-                    Pixel::RGB24,
-                    dst_w,
-                    dst_h,
-                    Flags::FAST_BILINEAR,
-                ) {
-                    sws = new_sws;
-                }
-            }
-            if sws.run(&frame, &mut rgb).is_err() {
-                continue;
-            }
-
-            let out = build_rgb_frame(&rgb, pts_secs, current_serial);
+            // Leer las dims destino MÁS RECIENTES justo antes de
+            // escalar: el resize se aplica al mismísimo siguiente
+            // frame (coalescencia atómica; el Scaler reconstruye si
+            // cambia cualquier dimensión de entrada o de salida).
+            let (dst_w, dst_h) = unpack_dims(target_dims.load(Ordering::Acquire));
+            let out = match scaler.scale(&frame, dst_w, dst_h) {
+                Some(rgb) => build_rgb_frame(rgb, pts_secs, current_serial),
+                None => continue,
+            };
             if send_with_stop(&tx, out, &stop, &serial_atomic, current_serial).is_err() {
                 break 'outer;
             }
@@ -462,9 +532,9 @@ fn send_with_stop(
 #[allow(clippy::too_many_arguments)]
 fn drain(
     decoder: &mut ffmpeg::decoder::Video,
-    sws: &mut SwsCtx,
+    scaler: &mut Scaler,
     frame: &mut VideoFrame,
-    rgb: &mut VideoFrame,
+    target_dims: &Arc<AtomicU64>,
     tx: &Sender<RgbFrame>,
     stop: &Arc<AtomicBool>,
     tb_num: f64,
@@ -481,10 +551,11 @@ fn drain(
         }
         let pts_ticks = frame.pts().unwrap_or(0);
         let pts_secs = pts_ticks as f64 * tb_num / tb_den;
-        if sws.run(frame, rgb).is_err() {
-            continue;
-        }
-        let out = build_rgb_frame(rgb, pts_secs, current_serial);
+        let (dst_w, dst_h) = unpack_dims(target_dims.load(Ordering::Acquire));
+        let out = match scaler.scale(frame, dst_w, dst_h) {
+            Some(rgb) => build_rgb_frame(rgb, pts_secs, current_serial),
+            None => continue,
+        };
         if send_with_stop(tx, out, stop, serial_atomic, current_serial).is_err() {
             break;
         }

@@ -129,7 +129,7 @@ pub fn run(cfg: Config) -> Result<()> {
         terminfo::adaptive_target_pixels(backend, cols, rows, cell_px, cfg.scale, hud_lines);
     let dec = decoder::spawn(&cfg.path, dst_w0, dst_h0)?;
 
-    let (mut dst_w, mut dst_h, mut col_ox, mut row_oy) = compute_layout(
+    let (mut dst_w, mut dst_h, _, _) = compute_layout(
         backend,
         dec.source_size,
         cols,
@@ -149,6 +149,13 @@ pub fn run(cfg: Config) -> Result<()> {
     let max_frame_dur: f64 = 10.0;
 
     let mut renderer_ = Renderer::new(backend);
+    renderer_.set_cell_px(cell_px.w, cell_px.h);
+
+    // Último frame mostrado — cacheado para redibujo INSTANTÁNEO al
+    // redimensionar la terminal (sin esperar al siguiente frame del
+    // decoder, que puede tardar si estamos en pausa o en hold). Es un
+    // move (no clone): coste cero por frame.
+    let mut last_frame: Option<decoder::RgbFrame> = None;
 
     // Estadísticas.
     let mut frames_shown_win: u64 = 0;
@@ -279,10 +286,16 @@ pub fn run(cfg: Config) -> Result<()> {
                     }
                 }
                 Cmd::Resize(c, r) => {
+                    // RESIZE robusto: NO tocamos relojes, ni sync, ni
+                    // la cola de frames. Solo (1) recalcular layout,
+                    // (2) store atómico de las dims nuevas al decoder
+                    // y (3) redibujar YA el último frame cacheado
+                    // (recortado por el renderer si no cabe) para que
+                    // la respuesta sea instantánea incluso en pausa.
                     cols = c.max(4);
                     rows = r.max(3);
                     hud_lines = hud_rows_for(cols, rows);
-                    let (nw, nh, nox, noy) = compute_layout(
+                    let (nw, nh, _, _) = compute_layout(
                         backend,
                         dec.source_size,
                         cols,
@@ -294,9 +307,18 @@ pub fn run(cfg: Config) -> Result<()> {
                     dst_w = nw;
                     dst_h = nh;
                     dec.resize(dst_w, dst_h);
-                    col_ox = nox;
-                    row_oy = noy;
                     force_full_redraw = true;
+                    if let Some(f) = last_frame.as_ref() {
+                        let vid_rows = rows.saturating_sub(hud_lines).max(1);
+                        let (ox, oy) =
+                            offsets_for_frame(backend, cell_px, f.width, f.height, cols, vid_rows);
+                        let mut sol = so.lock();
+                        let _ = write!(&mut sol, "\x1b[2J\x1b[H");
+                        renderer_.reset_layout_cache();
+                        let _ = renderer_.draw(&mut sol, f, cols, vid_rows, ox, oy);
+                        let _ = sol.flush();
+                        force_full_redraw = false;
+                    }
                 }
                 Cmd::None => {}
             }
@@ -319,13 +341,17 @@ pub fn run(cfg: Config) -> Result<()> {
                             }
                             pending_audio_landing = false;
                         }
+                        let vid_rows = rows.saturating_sub(hud_lines).max(1);
+                        let (ox, oy) = offsets_for_frame(
+                            backend, cell_px, frame.width, frame.height, cols, vid_rows,
+                        );
                         let mut sol = so.lock();
                         if force_full_redraw {
                             let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                             force_full_redraw = false;
                             renderer_.reset_layout_cache();
                         }
-                        let _ = renderer_.draw(&mut sol, &frame, cols, rows, col_ox, row_oy);
+                        let _ = renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy);
                         drop(sol);
                         last_shown_pts = frame.pts;
                         show_one_frame_paused = false;
@@ -344,6 +370,7 @@ pub fn run(cfg: Config) -> Result<()> {
                                 frames_dropped_win,
                             );
                         }
+                        last_frame = Some(frame);
                     }
                 }
             } else {
@@ -440,13 +467,16 @@ pub fn run(cfg: Config) -> Result<()> {
                 pending_audio_landing = false;
             }
             {
+                let vid_rows = rows.saturating_sub(hud_lines).max(1);
+                let (ox, oy) =
+                    offsets_for_frame(backend, cell_px, frame.width, frame.height, cols, vid_rows);
                 let mut sol = so.lock();
                 if force_full_redraw {
                     let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                     force_full_redraw = false;
                     renderer_.reset_layout_cache();
                 }
-                let _ = renderer_.draw(&mut sol, &frame, cols, rows, col_ox, row_oy);
+                let _ = renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy);
             }
             vidclk.set_pts(frame.pts, vidclk.current_serial());
             last_shown_pts = frame.pts;
@@ -484,6 +514,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 cfg.show_stats,
                 false,
             );
+            last_frame = Some(frame);
             continue;
         }
         // Reloj anclado: si veníamos de un hold, resincronizamos el
@@ -548,15 +579,22 @@ pub fn run(cfg: Config) -> Result<()> {
             }
         }
 
-        // 6) Dibujar el frame + HUD.
+        // 6) Dibujar el frame + HUD. El layout (offsets de centrado)
+        //    se recalcula POR FRAME a partir de las dims REALES del
+        //    frame: durante un resize conviven frames con dims viejas
+        //    y nuevas, y cada uno se centra/recorta correctamente sin
+        //    perder el colchón de pre-decode ni tocar el sync.
         {
+            let vid_rows = rows.saturating_sub(hud_lines).max(1);
+            let (ox, oy) =
+                offsets_for_frame(backend, cell_px, frame.width, frame.height, cols, vid_rows);
             let mut sol = so.lock();
             if force_full_redraw {
                 let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                 force_full_redraw = false;
                 renderer_.reset_layout_cache();
             }
-            let _ = renderer_.draw(&mut sol, &frame, cols, rows, col_ox, row_oy);
+            let _ = renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy);
         }
 
         // 7) Actualizar vidclk al PTS del frame que ACABAMOS de mostrar.
@@ -601,6 +639,7 @@ pub fn run(cfg: Config) -> Result<()> {
             cfg.show_stats,
             false,
         );
+        last_frame = Some(frame);
         frames_shown_win += 1;
 
         let el = stats_epoch.elapsed();
@@ -649,6 +688,27 @@ fn compute_layout(
     let ((w, h), (ox, oy)) = renderer::fit_aspect(source_size, (avail_w, avail_h), align_w, align_h);
     let (col_ox, row_oy) = px_to_cells(backend, cell_px, ox, oy);
     (w.max(2), h.max(2), col_ox, row_oy)
+}
+
+/// Celdas que ocupa un frame de `fw`×`fh` píxeles en este backend, y
+/// offsets de centrado dentro de `cols`×`vid_rows` (área sin HUD).
+/// Se calcula POR FRAME con las dims reales del frame — clave para
+/// que los frames con dims "viejas" durante un resize sigan centrados
+/// y recortados correctamente.
+fn offsets_for_frame(
+    backend: renderer::Backend,
+    cell: CellPx,
+    fw: u32,
+    fh: u32,
+    cols: u16,
+    vid_rows: u16,
+) -> (u16, u16) {
+    let (pcx, pcy) = px_per_cell(backend, cell);
+    let cw = fw.div_ceil(pcx.max(1)).max(1);
+    let ch = fh.div_ceil(pcy.max(1)).max(1);
+    let ox = (u32::from(cols).saturating_sub(cw)) / 2;
+    let oy = (u32::from(vid_rows).saturating_sub(ch)) / 2;
+    (ox.min(u16::MAX as u32) as u16, oy.min(u16::MAX as u32) as u16)
 }
 
 fn px_per_cell(backend: renderer::Backend, cell: CellPx) -> (u32, u32) {
