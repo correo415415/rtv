@@ -535,6 +535,19 @@ fn decode_loop(
             // tolerancia por redondeo de PTS). Seek normal: emitir
             // desde el keyframe (salto instantáneo estilo mpv).
             drop_until = if req.refine { Some(req.target_secs) } else { None };
+            // CATCH-UP RÁPIDO: durante el drop-until-target todos los
+            // frames pre-target se descartan sin mostrarse — no hace
+            // falta decodificar los NO-referencia (B-frames no-ref):
+            // skip_frame=NONREF acelera el re-decode del GOP (el
+            // tiempo muerto que hundía el caudal post-resize a ~0.76×
+            // en la tormenta del benchmark rtv-vs-mpv). Se restaura a
+            // Default en cuanto se alcanza el target. Decoders sin
+            // soporte de skip_frame lo ignoran (no-op seguro).
+            decoder.skip_frame(if drop_until.is_some() {
+                ffmpeg::Discard::NonReference
+            } else {
+                ffmpeg::Discard::Default
+            });
             // Seek a keyframe (mpv-style): NO descartamos frames hasta
             // el target. El primer frame decodificado (el keyframe
             // <= target) SE EMITE tal cual → salto de golpe. El player
@@ -614,6 +627,9 @@ fn decode_loop(
                     continue;
                 }
                 drop_until = None;
+                // Target alcanzado: volver a decodificar TODO (los
+                // no-ref saltados eran solo los del catch-up).
+                decoder.skip_frame(ffmpeg::Discard::Default);
             }
 
             // Copy-back GPU→RAM si el frame es una superficie HW
@@ -665,6 +681,10 @@ fn decode_loop(
                     let ts = (last_emitted_pts * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
                     let _ = ictx.seek(ts, ..=ts);
                     drop_until = Some(last_emitted_pts);
+                    // Mismo catch-up rápido que en el refine: los
+                    // frames pre-target se descartan → no decodificar
+                    // los no-referencia.
+                    decoder.skip_frame(ffmpeg::Discard::NonReference);
                 }
                 None => break 'outer,
             }
@@ -759,6 +779,7 @@ fn drain(
                 continue;
             }
             *drop_until = None;
+            decoder.skip_frame(ffmpeg::Discard::Default);
         }
         // Copy-back GPU→RAM también en el flush final. Si la
         // transferencia falla aquí no hay recuperación posible (es el
