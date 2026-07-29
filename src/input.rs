@@ -16,8 +16,13 @@ pub enum Cmd {
     None,
 }
 
-/// Drena todos los eventos pendientes SIN bloquear. Devuelve la
-/// última acción efectiva (si hay resize, se prioriza).
+/// Drena todos los eventos pendientes SIN bloquear.
+///
+/// Los `Resize` se COALESCEN: en una tormenta de resizes (arrastre del
+/// ratón) el terminal encola decenas de eventos; procesarlos todos
+/// significaba redibujar el frame cacheado + clear de pantalla una vez
+/// POR EVENTO → latêencia acumulada y parpadeo. Cada resize es absoluto,
+/// así que solo importa el ÚLTIMO.
 pub fn poll_command() -> std::io::Result<Vec<Cmd>> {
     let mut out = Vec::new();
     while event::poll(Duration::ZERO)? {
@@ -41,9 +46,23 @@ pub fn poll_command() -> std::io::Result<Vec<Cmd>> {
                     out.push(cmd);
                 }
             }
-            Event::Resize(c, r) => out.push(Cmd::Resize(c, r)),
+            Event::Resize(c, r) => {
+                // Coalescencia: sustituir cualquier Resize previo.
+                out.retain(|c| !matches!(c, Cmd::Resize(..)));
+                out.push(Cmd::Resize(c, r));
+            }
             _ => {}
         }
     }
     Ok(out)
+}
+
+/// Espera BLOQUEANTE hasta que haya un evento de terminal disponible o
+/// venza `timeout`. Devuelve `true` si hay evento pendiente. Es la
+/// pieza clave del "resize instantáneo": el player duerme sus esperas
+/// inter-frame AQUÍ en vez de en `thread::sleep`, de modo que un
+/// resize/tecla interrumpe la espera y se atiende en <1 ms en lugar de
+/// esperar a que venza el sleep (hasta 500 ms).
+pub fn wait_event(timeout: Duration) -> bool {
+    event::poll(timeout).unwrap_or(false)
 }

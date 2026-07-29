@@ -54,6 +54,13 @@ impl TerminalGuard {
     fn enter(so: &mut Stdout) -> Result<Self> {
         terminal::enable_raw_mode()?;
         execute!(so, EnterAlternateScreen, cursor::Hide)?;
+        // AUTOWRAP OFF (DECAWM): escribir en la última columna de la
+        // última fila con wrap activo hace scroll de TODA la pantalla
+        // → el vídeo sube una línea, el siguiente frame lo repinta…
+        // parpadeo masivo y "texto basura" en terminales pequeñas.
+        // Con wrap off, cualquier exceso se recorta en el borde.
+        let _ = write!(so, "\x1b[?7l");
+        let _ = so.flush();
         Ok(Self { active: true })
     }
 }
@@ -64,6 +71,8 @@ impl Drop for TerminalGuard {
             return;
         }
         let mut so = stdout();
+        // Restaurar autowrap y salir del alt-screen.
+        let _ = write!(so, "\x1b[?7h");
         let _ = execute!(so, cursor::Show, LeaveAlternateScreen);
         let _ = write!(so, "\x1b[0m");
         let _ = so.flush();
@@ -71,8 +80,18 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Caché del último HUD escrito: (cols, rows, hud_lines, l1, l2).
+/// Si el contenido no cambia, NO se reescribe la fila → el HUD pasa
+/// de reescribirse 25-60 veces/s a ~1 vez/s — adiós parpadeo.
+type HudCache = Option<(u16, u16, u16, String, String)>;
+
 fn hud_rows_for(cols: u16, rows: u16) -> u16 {
-    if rows >= 24 && cols >= 100 {
+    // Terminal minúscula: NO hay sitio para un HUD legible — pintarlo
+    // truncado a 4-15 columnas solo produce ruido que parpadea encima
+    // del vídeo. Mejor ocultarlo y dedicar todas las filas al vídeo.
+    if rows < 5 || cols < 16 {
+        0
+    } else if rows >= 24 && cols >= 100 {
         2
     } else {
         1
@@ -156,6 +175,19 @@ pub fn run(cfg: Config) -> Result<()> {
     // decoder, que puede tardar si estamos en pausa o en hold). Es un
     // move (no clone): coste cero por frame.
     let mut last_frame: Option<decoder::RgbFrame> = None;
+
+    // Frame PENDIENTE de mostrar (arquitectura ffplay): lo sacamos del
+    // canal en cuanto está disponible, pero si aún no toca mostrarlo
+    // la espera se hace con `input::wait_event` — interrumpible por
+    // teclas y resizes — y volvemos al top del loop. Así un resize se
+    // atiende en <1 ms, en vez de esperar a que venza un
+    // `thread::sleep` de hasta 500 ms (el resize "no instantáneo").
+    let mut pending: Option<decoder::RgbFrame> = None;
+
+    // Caché del último HUD escrito — si el texto no cambia no se
+    // reescribe la fila (el 90% de los refrescos), eliminando el
+    // parpadeo del HUD en terminales lentas/pequeñas.
+    let mut hud_cache: HudCache = None;
 
     // Estadísticas.
     let mut frames_shown_win: u64 = 0;
@@ -265,6 +297,8 @@ pub fn run(cfg: Config) -> Result<()> {
                     //       keyframe<=target + drop-until-target-PTS.
                     master.set(target);
                     dec.seek(target);
+                    // Descartar el frame en vuelo: su serial ya es viejo.
+                    pending = None;
                     // El audio saltará al PTS de ATERRIZAJE del vídeo
                     // (keyframe <= target) cuando llegue el primer
                     // frame post-seek — ver `pending_audio_landing`.
@@ -286,12 +320,15 @@ pub fn run(cfg: Config) -> Result<()> {
                     }
                 }
                 Cmd::Resize(c, r) => {
-                    // RESIZE robusto: NO tocamos relojes, ni sync, ni
-                    // la cola de frames. Solo (1) recalcular layout,
-                    // (2) store atómico de las dims nuevas al decoder
-                    // y (3) redibujar YA el último frame cacheado
-                    // (recortado por el renderer si no cabe) para que
-                    // la respuesta sea instantánea incluso en pausa.
+                    // RESIZE robusto e INSTANTÁNEO: NO tocamos relojes,
+                    // ni sync, ni la cola de frames. Solo (1) recalcular
+                    // layout, (2) store atómico de las dims nuevas al
+                    // decoder y (3) REESCALAR el último frame cacheado a
+                    // las dims nuevas (nearest, player-side) y pintarlo
+                    // YA — también cuando la terminal CRECE (antes solo
+                    // se recortaba al encoger; al agrandar se quedaba
+                    // pequeño hasta que el decoder alcanzaba las dims
+                    // nuevas, hasta ~2.5 s con la cola llena).
                     cols = c.max(4);
                     rows = r.max(3);
                     hud_lines = hud_rows_for(cols, rows);
@@ -307,14 +344,18 @@ pub fn run(cfg: Config) -> Result<()> {
                     dst_w = nw;
                     dst_h = nh;
                     dec.resize(dst_w, dst_h);
+                    hud_cache = None;
+                    renderer_.reset_layout_cache();
                     force_full_redraw = true;
-                    if let Some(f) = last_frame.as_ref() {
+                    if let Some(f) = last_frame.as_mut() {
+                        rescale_frame_nearest(f, dst_w, dst_h);
                         let vid_rows = rows.saturating_sub(hud_lines).max(1);
                         let (ox, oy) =
                             offsets_for_frame(backend, cell_px, f.width, f.height, cols, vid_rows);
                         let mut sol = so.lock();
-                        let _ = write!(&mut sol, "\x1b[2J\x1b[H");
-                        renderer_.reset_layout_cache();
+                        // El renderer emite UN solo 2J (layout cambió);
+                        // el doble clear manual anterior duplicaba el
+                        // "flash" por evento de resize.
                         let _ = renderer_.draw(&mut sol, f, cols, vid_rows, ox, oy);
                         let _ = sol.flush();
                         force_full_redraw = false;
@@ -329,8 +370,11 @@ pub fn run(cfg: Config) -> Result<()> {
         //    (el del target) y lo pintamos sin salir de la pausa.
         if master.is_paused() {
             if show_one_frame_paused {
-                if let Ok(frame) = dec.rx.recv_timeout(Duration::from_millis(200)) {
+                if let Ok(mut frame) = dec.rx.recv_timeout(Duration::from_millis(200)) {
                     if frame.serial == dec.current_serial() {
+                        if frame.width != dst_w || frame.height != dst_h {
+                            rescale_frame_nearest(&mut frame, dst_w, dst_h);
+                        }
                         // Aterrizaje del seek en pausa: re-apuntar los
                         // relojes al PTS real y alinear el audio para
                         // que al reanudar suene EXACTAMENTE aquí.
@@ -349,9 +393,12 @@ pub fn run(cfg: Config) -> Result<()> {
                         if force_full_redraw {
                             let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                             force_full_redraw = false;
+                            hud_cache = None;
                             renderer_.reset_layout_cache();
                         }
-                        let _ = renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy);
+                        if matches!(renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy), Ok(true)) {
+                            hud_cache = None;
+                        }
                         drop(sol);
                         last_shown_pts = frame.pts;
                         show_one_frame_paused = false;
@@ -374,7 +421,10 @@ pub fn run(cfg: Config) -> Result<()> {
                     }
                 }
             } else {
-                std::thread::sleep(Duration::from_millis(20));
+                // Espera INTERRUMPIBLE por eventos: una tecla o un
+                // resize despiertan al instante (antes: sleep fijo de
+                // 20 ms que retrasaba la respuesta en pausa).
+                input::wait_event(Duration::from_millis(50));
             }
             draw_hud_dispatch(
                 &mut so,
@@ -394,6 +444,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 using_audio,
                 cfg.show_stats,
                 true,
+                &mut hud_cache,
             );
             continue;
         }
@@ -411,31 +462,37 @@ pub fn run(cfg: Config) -> Result<()> {
             if hold_started.map(|t| t.elapsed() > Duration::from_millis(1500)).unwrap_or(false) {
                 master.master().force_anchor();
             } else {
-                std::thread::sleep(Duration::from_millis(4));
+                // Interrumpible: un resize durante el hold se atiende YA.
+                input::wait_event(Duration::from_millis(4));
                 continue;
             }
         }
 
-        // 3) Obtener siguiente frame (con timeout corto para poder
-        //    seguir procesando input y HUD si el decoder está lento).
-        let frame = match dec.rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(f) => f,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if dec.eof.load(Ordering::Relaxed) {
-                    if cfg.loop_video {
-                        master.set(0.0);
-                        dec.seek(0.0);
-                        pending_audio_landing = using_audio;
-                        frame_timer = wall_now_f64();
-                        last_shown_pts = 0.0;
-                        force_full_redraw = true;
-                        continue;
+        // 3) Obtener siguiente frame: el PENDIENTE de la iteración
+        //    anterior (aún no le tocaba mostrarse) o uno nuevo del
+        //    canal (timeout corto para seguir procesando input y HUD
+        //    si el decoder está lento).
+        let mut frame = match pending.take() {
+            Some(f) => f,
+            None => match dec.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(f) => f,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if dec.eof.load(Ordering::Relaxed) {
+                        if cfg.loop_video {
+                            master.set(0.0);
+                            dec.seek(0.0);
+                            pending_audio_landing = using_audio;
+                            frame_timer = wall_now_f64();
+                            last_shown_pts = 0.0;
+                            force_full_redraw = true;
+                            continue;
+                        }
+                        break 'main;
                     }
-                    break 'main;
+                    continue;
                 }
-                continue;
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break 'main,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break 'main,
+            },
         };
 
         // 4) Descartar frames con serial obsoleto (residuo tras seek
@@ -443,6 +500,17 @@ pub fn run(cfg: Config) -> Result<()> {
         let cur_serial = dec.current_serial();
         if frame.serial != cur_serial {
             continue;
+        }
+
+        // 4.1) Frame con dims VIEJAS (resize en vuelo): reescalado
+        //      nearest player-side a las dims nuevas. La cola puede
+        //      contener hasta ~2.5 s de frames pre-decodificados con
+        //      las dims anteriores; antes se mostraban recortados (al
+        //      encoger) o minúsculos (al agrandar) hasta que el
+        //      decoder alcanzaba las dims nuevas — el resize "tardaba".
+        //      Ahora TODOS los frames se muestran ya al tamaño nuevo.
+        if frame.width != dst_w || frame.height != dst_h {
+            rescale_frame_nearest(&mut frame, dst_w, dst_h);
         }
 
         let cur_pts_ms = (frame.pts * 1000.0) as i64;
@@ -474,9 +542,12 @@ pub fn run(cfg: Config) -> Result<()> {
                 if force_full_redraw {
                     let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                     force_full_redraw = false;
+                    hud_cache = None;
                     renderer_.reset_layout_cache();
                 }
-                let _ = renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy);
+                if matches!(renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy), Ok(true)) {
+                    hud_cache = None;
+                }
             }
             vidclk.set_pts(frame.pts, vidclk.current_serial());
             last_shown_pts = frame.pts;
@@ -513,6 +584,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 using_audio,
                 cfg.show_stats,
                 false,
+                &mut hud_cache,
             );
             last_frame = Some(frame);
             continue;
@@ -571,11 +643,19 @@ pub fn run(cfg: Config) -> Result<()> {
             continue;
         }
 
-        // Si aún no toca mostrar, dormimos justo hasta frame_timer.
+        // Si aún no toca mostrar, esperamos hasta frame_timer — pero
+        // de forma INTERRUMPIBLE: si llega un evento (resize, tecla)
+        // devolvemos el frame a `pending`, retrocedemos frame_timer
+        // (se re-sumará al reprocesar el frame) y volvemos al top del
+        // loop para atender el evento YA. Antes: `thread::sleep` de
+        // hasta 500 ms → el resize se atendía al despertar → la
+        // sensación de "resize no instantáneo".
         if frame_timer > now_wall {
             let sleep_s = (frame_timer - now_wall).min(0.5);
-            if sleep_s > 0.0005 {
-                std::thread::sleep(Duration::from_secs_f64(sleep_s));
+            if sleep_s > 0.0005 && input::wait_event(Duration::from_secs_f64(sleep_s)) {
+                frame_timer -= target_delay;
+                pending = Some(frame);
+                continue;
             }
         }
 
@@ -592,9 +672,12 @@ pub fn run(cfg: Config) -> Result<()> {
             if force_full_redraw {
                 let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                 force_full_redraw = false;
+                hud_cache = None;
                 renderer_.reset_layout_cache();
             }
-            let _ = renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy);
+            if matches!(renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy), Ok(true)) {
+                hud_cache = None;
+            }
         }
 
         // 7) Actualizar vidclk al PTS del frame que ACABAMOS de mostrar.
@@ -638,6 +721,7 @@ pub fn run(cfg: Config) -> Result<()> {
             using_audio,
             cfg.show_stats,
             false,
+            &mut hud_cache,
         );
         last_frame = Some(frame);
         frames_shown_win += 1;
@@ -748,7 +832,18 @@ fn draw_hud_dispatch(
     using_audio: bool,
     show_stats: bool,
     paused: bool,
+    cache: &mut HudCache,
 ) {
+    // Terminal minúscula: HUD oculto — no hay nada legible que pintar
+    // y reescribirlo truncado cada frame es la fuente principal del
+    // parpadeo con ventanas pequeñas.
+    if hud_lines == 0 {
+        // Flush pendiente del frame recién dibujado (antes lo hacía
+        // este mismo dispatch al escribir el HUD).
+        let mut sol = so.lock();
+        let _ = sol.flush();
+        return;
+    }
     let (l1, l2) = format_hud_lines(
         clock,
         duration,
@@ -766,13 +861,58 @@ fn draw_hud_dispatch(
         cols,
         hud_lines,
     );
+    // Caché anti-parpadeo: si el HUD no cambió (mismo tamaño de
+    // terminal y mismo texto), NO se reescribe la fila. El HUD solo
+    // cambia ~1 vez/s (el reloj), pero se despachaba a fps completos
+    // (25-60/s): cada reescritura es un borrado+repintado visible en
+    // terminales lentas → el "parpadeo del HUD".
+    let key = (cols, rows, hud_lines, l1, l2);
+    let dirty = cache.as_ref() != Some(&key);
     let mut sol = so.lock();
-    if hud_lines == 2 {
-        let _ = renderer::draw_hud_two_lines(&mut sol, cols, rows, &l1, &l2);
-    } else {
-        let _ = renderer::draw_hud(&mut sol, cols, rows, &l1);
+    if dirty {
+        if hud_lines == 2 {
+            let _ = renderer::draw_hud_two_lines(&mut sol, cols, rows, &key.3, &key.4);
+        } else {
+            let _ = renderer::draw_hud(&mut sol, cols, rows, &key.3);
+        }
+        *cache = Some(key);
     }
     let _ = sol.flush();
+}
+
+/// Reescala un RgbFrame a `dst_w`×`dst_h` con nearest-neighbor.
+/// Se usa SOLO en transitorios de resize (frames pre-decodificados con
+/// dims viejas y redibujo del frame cacheado): el siguiente frame que
+/// salga del decoder ya viene reescalado con FAST_BILINEAR de sws.
+/// Coste: O(w·h) con LUT de índices — ~1 ms para 300×90 celdas, nada
+/// comparado con el frame budget de 40 ms a 25 fps.
+fn rescale_frame_nearest(f: &mut decoder::RgbFrame, dst_w: u32, dst_h: u32) {
+    let (sw, sh) = (f.width as usize, f.height as usize);
+    let (dw, dh) = (dst_w.max(2) as usize, dst_h.max(2) as usize);
+    if sw == 0 || sh == 0 || (sw == dw && sh == dh) || f.data.len() < sw * sh * 3 {
+        return;
+    }
+    // LUT de mapeo columna destino → columna origen (evita el div/mul
+    // por píxel en el bucle caliente).
+    let mut xmap = Vec::with_capacity(dw);
+    for x in 0..dw {
+        xmap.push((x * sw / dw).min(sw - 1) * 3);
+    }
+    let mut out = vec![0u8; dw * dh * 3];
+    for y in 0..dh {
+        let sy = (y * sh / dh).min(sh - 1);
+        let srow = &f.data[sy * sw * 3..sy * sw * 3 + sw * 3];
+        let drow = &mut out[y * dw * 3..y * dw * 3 + dw * 3];
+        for (x, &sx) in xmap.iter().enumerate() {
+            let d = x * 3;
+            drow[d] = srow[sx];
+            drow[d + 1] = srow[sx + 1];
+            drow[d + 2] = srow[sx + 2];
+        }
+    }
+    f.width = dst_w.max(2);
+    f.height = dst_h.max(2);
+    f.data = out;
 }
 
 #[allow(clippy::too_many_arguments)]
