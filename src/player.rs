@@ -234,10 +234,33 @@ pub fn run(cfg: Config) -> Result<()> {
     // decodificar en silencio todo el GOP hasta el target (que con
     // AV1 4K tardaba varios segundos y desincronizaba todo).
     let mut pending_audio_landing = false;
+    // REFINADO DE CALIDAD tras AGRANDAR la terminal: la cola de
+    // pre-decode guarda hasta ~2.5 s de frames escalados a las dims
+    // VIEJAS (pequeñas). Al encoger no importa (reducir un frame
+    // grande se ve bien), pero al agrandar esos frames se upscalean
+    // con nearest → borrosos hasta que la cola se vacía. El fix: con
+    // debounce de 300 ms tras el último grow, pedir al decoder un
+    // `refine_at(now)` — re-seek al punto actual que drena la cola y
+    // re-decodifica DESDE AQUÍ con las dims nuevas (drop-until-target
+    // exacto, sin salto visual). Los relojes y el audio NO se tocan:
+    // el sonido sigue y los frames nítidos entran donde toca.
+    let mut refine_deadline: Option<Instant> = None;
+    // Serial del refinado EN CURSO: mientras el decoder re-decodifica
+    // el GOP para alcanzar al reloj maestro, sus frames llegan "tarde"
+    // y el drop estándar de ffplay los tiraría todos — pantalla
+    // congelada y borrosa hasta el final del catch-up. En vez de eso
+    // los MOSTRAMOS (estilo mpv con hr-seek lento): la imagen se ve
+    // nítida en cuanto se decodifica el primer frame refinado y
+    // "alcanza" visiblemente al audio. Se limpia al primer frame que
+    // llega a tiempo (catch-up completado).
+    let mut refine_catchup: Option<i32> = None;
 
     // Log de sincronía opcional (para tests de integración):
     // RTV_SYNC_LOG=/ruta/fichero → una línea por frame mostrado:
-    //   wall_s master_s video_pts_s avdiff_ms dropped_win
+    //   wall_s master_s video_pts_s avdiff_ms dropped_win dec_w dec_h
+    // (dec_w/dec_h = dims NATIVAS del decoder, no las del reescalado
+    // player-side; sirven para medir la recuperación de calidad tras
+    // agrandar la terminal.)
     let mut sync_log: Option<std::io::BufWriter<std::fs::File>> =
         std::env::var("RTV_SYNC_LOG").ok().and_then(|p| {
             std::fs::File::create(p).ok().map(std::io::BufWriter::new)
@@ -299,6 +322,10 @@ pub fn run(cfg: Config) -> Result<()> {
                     dec.seek(target);
                     // Descartar el frame en vuelo: su serial ya es viejo.
                     pending = None;
+                    // Un seek real drena la cola y re-decodifica con
+                    // las dims vigentes: el refinado ya no hace falta.
+                    refine_deadline = None;
+                    refine_catchup = None;
                     // El audio saltará al PTS de ATERRIZAJE del vídeo
                     // (keyframe <= target) cuando llegue el primer
                     // frame post-seek — ver `pending_audio_landing`.
@@ -341,6 +368,17 @@ pub fn run(cfg: Config) -> Result<()> {
                         cfg.scale,
                         hud_lines,
                     );
+                    // ¿Creció el área de vídeo? → programar refinado
+                    // (debounce 300 ms: en un arrastre solo se refina
+                    // al soltar). Al encoger se cancela: reducir los
+                    // frames grandes de la cola ya se ve perfecto.
+                    let grew =
+                        (u64::from(nw) * u64::from(nh)) > (u64::from(dst_w) * u64::from(dst_h));
+                    refine_deadline = if grew {
+                        Some(Instant::now() + Duration::from_millis(300))
+                    } else {
+                        None
+                    };
                     dst_w = nw;
                     dst_h = nh;
                     dec.resize(dst_w, dst_h);
@@ -365,6 +403,39 @@ pub fn run(cfg: Config) -> Result<()> {
             }
         }
 
+        // 1.5) Disparo del REFINADO de calidad (debounce vencido).
+        //      Reproduciendo: re-decode desde un poco por delante del
+        //      reloj maestro, para que el primer frame refinado no
+        //      llegue ya tarde. En pausa: re-decode del frame en
+        //      pantalla y mostrarlo vía show_one_frame_paused (sin
+        //      tocar audio ni relojes — pending_audio_landing queda
+        //      false, así que el aterrizaje NO re-apunta nada).
+        if refine_deadline.map(|t| Instant::now() >= t).unwrap_or(false) {
+            refine_deadline = None;
+            let max_t = (dec.duration - 0.5).max(0.0);
+            if master.is_paused() {
+                dec.refine_at(last_shown_pts.min(max_t));
+                show_one_frame_paused = true;
+                refine_catchup = None;
+            } else if using_audio && !master.master_anchored() {
+                // En pleno hold post-seek: reintentar en 200 ms (el
+                // seek en curso ya decodifica con las dims nuevas,
+                // así que normalmente ni hará falta).
+                refine_deadline = Some(Instant::now() + Duration::from_millis(200));
+            } else {
+                // Lead PEQUEÑO (50 ms): el primer frame refinado con
+                // pts >= target se muestra en cuanto el maestro lo
+                // alcanza. Un lead grande impone ESA congelación de
+                // más aunque el decode sea instantáneo; uno pequeño no
+                // penaliza el caso lento (los frames tardíos se
+                // dropean igual y el punto de re-sincronía es el
+                // mismo: cuando el decode alcanza al reloj maestro).
+                let target = (master.now() + 0.05).max(0.0).min(max_t);
+                refine_catchup = Some(dec.refine_at(target));
+                pending = None; // serial obsoleto
+            }
+        }
+
         // 2) Pausa: dormimos un pelín y actualizamos HUD. Si hay un
         //    seek pendiente de visualizar, sacamos UN frame del decoder
         //    (el del target) y lo pintamos sin salir de la pausa.
@@ -372,6 +443,10 @@ pub fn run(cfg: Config) -> Result<()> {
             if show_one_frame_paused {
                 if let Ok(mut frame) = dec.rx.recv_timeout(Duration::from_millis(200)) {
                     if frame.serial == dec.current_serial() {
+                        // Dims NATIVAS del decoder (antes del reescalado
+                        // player-side) — es lo que registra el sync-log
+                        // para poder medir la recuperación de calidad.
+                        let (dec_w, dec_h) = (frame.width, frame.height);
                         if frame.width != dst_w || frame.height != dst_h {
                             rescale_frame_nearest(&mut frame, dst_w, dst_h);
                         }
@@ -409,13 +484,16 @@ pub fn run(cfg: Config) -> Result<()> {
                             let m = master.now();
                             let _ = writeln!(
                                 log,
-                                "{:.4} {:.4} {:.4} {:+.1} {}",
+                                "{:.4} {:.4} {:.4} {:+.1} {} {} {}",
                                 wall_now_f64(),
                                 m,
                                 frame.pts,
                                 (frame.pts - m) * 1000.0,
                                 frames_dropped_win,
+                                dec_w,
+                                dec_h,
                             );
+                            let _ = log.flush();
                         }
                         last_frame = Some(frame);
                     }
@@ -509,6 +587,8 @@ pub fn run(cfg: Config) -> Result<()> {
         //      encoger) o minúsculos (al agrandar) hasta que el
         //      decoder alcanzaba las dims nuevas — el resize "tardaba".
         //      Ahora TODOS los frames se muestran ya al tamaño nuevo.
+        //      (dec_w/dec_h conservan las dims NATIVAS para el sync-log.)
+        let (dec_w, dec_h) = (frame.width, frame.height);
         if frame.width != dst_w || frame.height != dst_h {
             rescale_frame_nearest(&mut frame, dst_w, dst_h);
         }
@@ -558,13 +638,16 @@ pub fn run(cfg: Config) -> Result<()> {
                 let m = master.now();
                 let _ = writeln!(
                     log,
-                    "{:.4} {:.4} {:.4} {:+.1} {}",
+                    "{:.4} {:.4} {:.4} {:+.1} {} {} {}",
                     wall_now_f64(),
                     m,
                     frame.pts,
                     (frame.pts - m) * 1000.0,
                     frames_dropped_win,
+                    dec_w,
+                    dec_h,
                 );
+                let _ = log.flush();
             }
             draw_hud_dispatch(
                 &mut so,
@@ -636,11 +719,25 @@ pub fn run(cfg: Config) -> Result<()> {
 
         // ¿Este frame llega claramente tarde respecto al maestro?
         // → drop (pero frame_timer ya avanzó, no acumulamos deuda).
+        //
+        // EXCEPCIÓN — catch-up del refinado post-resize: mientras el
+        // decoder re-decodifica el GOP para alcanzar al reloj, TODOS
+        // sus frames llegan "tarde"; droparlos = pantalla congelada y
+        // borrosa hasta el final del catch-up. Los mostramos sin
+        // dormir (la calidad se recupera al primer frame nítido y el
+        // vídeo "alcanza" al audio de forma visible, estilo mpv). El
+        // catch-up acaba con el primer frame que llega a tiempo.
         let master_diff = frame.pts - master.now();
         if master_diff.is_finite() && master_diff < -AV_SYNC_THRESHOLD_MAX {
-            frames_dropped_win += 1;
-            last_shown_pts = frame.pts;
-            continue;
+            if refine_catchup == Some(frame.serial) {
+                frame_timer = now_wall; // mostrar YA, sin deuda
+            } else {
+                frames_dropped_win += 1;
+                last_shown_pts = frame.pts;
+                continue;
+            }
+        } else {
+            refine_catchup = None; // frame a tiempo: catch-up completado
         }
 
         // Si aún no toca mostrar, esperamos hasta frame_timer — pero
@@ -694,13 +791,16 @@ pub fn run(cfg: Config) -> Result<()> {
             let m = master.now();
             let _ = writeln!(
                 log,
-                "{:.4} {:.4} {:.4} {:+.1} {}",
+                "{:.4} {:.4} {:.4} {:+.1} {} {} {}",
                 wall_now_f64(),
                 m,
                 frame.pts,
                 (frame.pts - m) * 1000.0,
                 frames_dropped_win,
+                dec_w,
+                dec_h,
             );
+            let _ = log.flush();
         }
 
         draw_hud_dispatch(
