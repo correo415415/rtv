@@ -362,11 +362,22 @@ pub fn compute_target_delay(natural_delay: f64, diff: f64) -> f64 {
         // Corrección SUAVE dentro del umbral: ffplay tolera hasta
         // ±sync_threshold sin corregir, lo que deja offsets
         // sistemáticos de ~±40 ms clavados para siempre (p.ej. el
-        // establecido al anclar el audio tras un seek). Aplicamos una
-        // corrección proporcional (50% del diff por frame, acotada a
-        // ±30% del delay natural) que converge geométricamente a 0
-        // sin producir jitter visible.
-        let correction = (diff * 0.5).clamp(-natural_delay * 0.3, natural_delay * 0.3);
+        // establecido al anclar el audio tras un seek).
+        //
+        // Dos regímenes:
+        //   * |diff| <= 10 ms → corrección COMPLETA en un frame
+        //     (acotada a ±30% del delay natural). Desplazar la
+        //     presentación <=10 ms es invisible, y elimina de golpe
+        //     el residuo que la corrección proporcional dejaba
+        //     muriendo geométricamente (décimas de ms de mediana en
+        //     el sync-log post-seek durante segundos).
+        //   * |diff| > 10 ms → corrección proporcional (50% del diff
+        //     por frame, misma cota) que converge sin jitter visible.
+        let correction = if diff.abs() <= 0.010 {
+            diff.clamp(-natural_delay * 0.3, natural_delay * 0.3)
+        } else {
+            (diff * 0.5).clamp(-natural_delay * 0.3, natural_delay * 0.3)
+        };
         return (natural_delay + correction).max(0.0);
     }
     natural_delay
@@ -447,6 +458,22 @@ mod tests {
         assert!((d - 0.240).abs() < 1e-9, "esperado 0.240, got {d}");
         // Diff > NOSYNC (10s) → devuelve delay natural sin ajuste.
         assert_eq!(compute_target_delay(0.040, 95.0), 0.040);
+    }
+
+    #[test]
+    fn compute_target_delay_small_diff_full_correction() {
+        // |diff| <= 10 ms → corrección COMPLETA en un frame (invisible
+        // al ojo, elimina el residuo post-seek en una pasada).
+        let d = compute_target_delay(0.040, 0.008);
+        assert!((d - 0.048).abs() < 1e-9, "esperado 0.048, got {d}");
+        let d = compute_target_delay(0.040, -0.008);
+        assert!((d - 0.032).abs() < 1e-9, "esperado 0.032, got {d}");
+        // Pero acotada a ±30% del delay natural (natural muy corto).
+        let d = compute_target_delay(0.010, 0.009);
+        assert!((d - 0.013).abs() < 1e-9, "esperado 0.013 (cap 30%), got {d}");
+        // |diff| > 10 ms → régimen proporcional (50%), también acotado.
+        let d = compute_target_delay(0.040, 0.020);
+        assert!((d - 0.050).abs() < 1e-9, "esperado 0.050, got {d}");
     }
 
     #[test]
