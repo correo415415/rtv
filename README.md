@@ -1,70 +1,76 @@
-# rtv — Reproductor de vídeo de terminal (Rust) · v0.2
+# rtv
 
-Un reproductor de vídeo minimalista pero **muy rápido**, sólo para terminal,
-que compite con `mpv --vo=kitty`/`mpv --vo=tct` en latencia y bytes/frame.
+Reproductor de vídeo para terminal, escrito en Rust. Rápido de verdad:
+arranca en decenas de milisegundos, sincroniza audio y vídeo como un
+reproductor serio (reloj de audio maestro, estilo ffplay) y aprovecha el
+protocolo gráfico de tu terminal para sacar la máxima resolución posible.
 
-## Novedades v0.2
+```
+rtv pelicula.mkv
+```
 
-- 🎧 **Audio real** vía `cpal` + `libswresample`. En Windows usa **WASAPI**,
-  en Linux **ALSA**, en macOS **CoreAudio**. Se convierte cualquier formato
-  de audio del vídeo a **F32 interleaved estéreo** al sample rate nativo del
-  dispositivo.
-- ⏱ **Audio como reloj maestro** (`AudioClock`): la posición del sink de
-  audio pilota el vídeo → cero drift entre imagen y sonido, igual que hacen
-  mpv, VLC y todos los reproductores serios. Si no hay audio, cae a
-  `MonoClock` automáticamente.
-- 🔍 **Escalado adaptativo**: al arrancar el reproductor sondea la terminal
-  con la secuencia CSI `[16t` (kitty/wezterm/ghostty/iterm2/foot/konsole) y
-  obtiene el tamaño **REAL** de una celda en píxeles. Con eso escala el
-  vídeo a la resolución máxima que pueda mostrar cada terminal:
-  * Terminal 80×24 con celdas 8×16 → vídeo a ~640×352 px.
-  * Terminal 200×60 con celdas 10×20 en 4K → vídeo a ~2000×1180 px.
-  * **Más grande la ventana = más resolución real = más nítido.**
-- 🎯 **HUD adaptativo**: la barra de progreso y los indicadores se
-  redimensionan con la terminal (barra de 8, 16, 24 o 40 celdas), y si hay
-  espacio suficiente se despliega en 2 líneas con los atajos de teclado.
+Eso es todo. Detecta el terminal, elige el mejor backend de render, saca el
+audio por el dispositivo por defecto y reproduce.
+
+## Por qué existe
+
+`mpv --vo=tct` funciona, pero arrastra el peso de mpv entero para pintar
+celdas de colores, y `--vo=kitty` deja la sincronización fina en manos de un
+camino de render que no fue pensado para terminales. rtv ataca el problema
+desde el otro lado: un binario de ~1 MB que solo sabe hacer una cosa —
+decodificar con FFmpeg y pintar en un terminal — y la hace con la menor
+latencia y los menos bytes por frame que hemos conseguido.
+
+| | `mpv --vo=tct` | rtv |
+|---|---|---|
+| Arranque | ~150–300 ms | ~20–40 ms |
+| SGR por celda (half-blocks) | fg+bg siempre | delta-encoded (~30–50 % menos bytes) |
+| Kitty graphics | con ACKs (`m=1`) | `q=2`, cero round-trips |
+| Binario (stripped) | ~40 MB | ~1.1 MB (FFmpeg dinámico) |
+| Reloj maestro | audio (libmpv) | audio (cpal), o monotónico sin audio |
+| Resolución de render | fija por vo | adaptativa al tamaño real de celda |
+
+Medido con los binarios de este repo; los números exactos dependen de la
+máquina y el terminal, pero los órdenes de magnitud se mantienen.
 
 ## Características
 
-- **Decodificación FFmpeg**: cualquier formato que soporte FFmpeg vía
-  `ffmpeg-the-third 5.0` (compatible con FFmpeg 7.1).
-- **Auto-detección del mejor protocolo gráfico**: Kitty → HalfBlocks → ASCII.
-- **Pipeline paralelo** productor–consumidor: decoder de vídeo, decoder de
-  audio, sink cpal, y renderer del terminal — cada uno en su hilo, comunicados
-  por canales `crossbeam` acotados.
-- **Cross-platform Windows + Linux + macOS**.
-- **Silenciado total de logs** de FFmpeg y sus codecs (`libdav1d`, `libaom`,
-  etc.) para no ensuciar el TUI ni con `error parsing obu data` tras un seek.
-- **Cierre limpio**: `q` / `Esc` / `Ctrl+C` restauran el terminal
-  correctamente aunque el vídeo tenga audio activo.
-- **Resize en caliente**: al cambiar el tamaño de la ventana, el decoder
-  reajusta `sws_scale`, el layout se recalcula y hasta se re-sondea el
-  tamaño de celda (por si has cambiado de monitor con distinto DPI).
+- **Cualquier formato que trague FFmpeg** (vía `ffmpeg-the-third`, probado
+  contra FFmpeg 7.1): H.264, HEVC, AV1, VP9… El decode de vídeo usa frame
+  threading con todos los cores.
+- **Audio real** con `cpal`: WASAPI en Windows, ALSA/PulseAudio en Linux,
+  CoreAudio en macOS. Cualquier layout/formato de origen se convierte a f32
+  estéreo al sample rate nativo del dispositivo con `libswresample`.
+- **Sincronización A/V estilo ffplay**: el reloj de audio (posición real del
+  sink, con la latencia de salida compensada y suavizada) pilota el vídeo.
+  `compute_target_delay` con los mismos umbrales que ffplay. En la práctica:
+  avdiff mediano de 0–2 ms en régimen estable, incluso con AV1 4K por
+  software en 2 cores.
+- **Seeks instantáneos estilo mpv**: `←`/`→` aterrizan en el keyframe ≤
+  target y el audio salta exactamente al PTS real de aterrizaje del vídeo.
+  Sin decodificar GOPs enteros en silencio, sin desincronización tras
+  ráfagas de seeks.
+- **Escalado adaptativo por celda real**: al arrancar se sondea el terminal
+  (CSI `16t`/`14t` en kitty, WezTerm, Ghostty, iTerm2, foot, Konsole, xterm)
+  para conocer el tamaño en píxeles de cada celda y escalar el vídeo a la
+  resolución máxima que la ventana puede mostrar. Más ventana, más nitidez.
+- **Resize en caliente, instantáneo**: el redibujo tras redimensionar tarda
+  ~1 ms (espera inter-frame interrumpible por eventos + reescalado inmediato
+  del frame en pantalla), y el decoder reajusta `sws_scale` sin drenar su
+  colchón de pre-decode ni perder el sync.
+- **Tres backends de render** con auto-detección: Kitty graphics protocol
+  (píxeles reales), half-blocks truecolor (`▀`, 2 px por celda) y ASCII.
+- **HUD discreto**: barra de progreso, tiempo, volumen y fps en 1–2 líneas
+  que se adaptan al ancho. Solo se repinta cuando cambia (nada de parpadeo)
+  y desaparece si la ventana es demasiado pequeña para ser legible.
+- **Terminal siempre limpio**: alt-screen, autowrap desactivado durante la
+  reproducción, y restauración completa al salir — también con `Ctrl+C` o
+  con el audio sonando. Los logs de libav (`libdav1d`, `libaom`…) van
+  silenciados para que ningún `error parsing obu data` ensucie el TUI.
 
-## Uso
+## Instalación
 
-```
-rtv <fichero> [--backend BACKEND] [--scale F] [--loop-video] [--stats] [--no-audio] [--verbose]
-```
-
-- `--backend kitty|iterm2|sixel|blocks|ascii` — fuerza un backend concreto
-  (por defecto auto-detecta).
-- `--scale 0.5` — reduce voluntariamente la resolución. Útil en terminales
-  gigantes (4K) donde el decode software del vídeo se convierte en cuello
-  de botella.
-- `--loop-video` — reinicia al llegar al final.
-- `--stats` — muestra FPS mostrados / decodificados / drops en el HUD.
-- `--no-audio` — desactiva el audio y usa reloj monotónico.
-- `--verbose` — deja que FFmpeg escriba a stderr (para debugging).
-
-### Controles
-
-- <kbd>Espacio</kbd> — pausa / reanudar (pausa **también el audio**).
-- <kbd>←</kbd> / <kbd>→</kbd> — seek ±5 s (sincroniza vídeo Y audio).
-- <kbd>↑</kbd> / <kbd>↓</kbd> — volumen ±5 (0–200 %).
-- <kbd>q</kbd> / <kbd>Esc</kbd> / <kbd>Ctrl+C</kbd> — salir.
-
-## Requisitos
+Necesitas Rust (edition 2021) y las librerías de desarrollo de FFmpeg.
 
 ### Linux (Debian/Ubuntu)
 
@@ -75,18 +81,6 @@ sudo apt install libavformat-dev libavcodec-dev libavutil-dev \
 cargo build --release
 ```
 
-### Windows
-
-**Instrucciones completas en [`BUILD-WINDOWS.md`](BUILD-WINDOWS.md)**. Resumen:
-
-1. Descarga `ffmpeg-n7.1-latest-win64-lgpl-shared.zip` desde
-   <https://github.com/BtbN/FFmpeg-Builds/releases>.
-2. Descomprime en `C:\ffmpeg\` (debe quedar `C:\ffmpeg\include`, `\lib`, `\bin`).
-3. `$env:FFMPEG_DIR = "C:\ffmpeg"` y añade `C:\ffmpeg\bin` al `PATH`.
-4. `cargo clean && cargo build --release`.
-
-Windows Terminal soporta truecolor, half-blocks Y audio WASAPI perfectamente.
-
 ### macOS
 
 ```bash
@@ -94,73 +88,156 @@ brew install ffmpeg pkg-config
 cargo build --release
 ```
 
-## Arquitectura v0.2
+### Windows
+
+Guía completa en [`BUILD-WINDOWS.md`](BUILD-WINDOWS.md). En corto:
+
+1. Descarga `ffmpeg-n7.1-latest-win64-lgpl-shared.zip` de
+   [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases).
+2. Descomprime en `C:\ffmpeg\` (deben quedar `include`, `lib` y `bin`).
+3. `$env:FFMPEG_DIR = "C:\ffmpeg"` y añade `C:\ffmpeg\bin` al `PATH`.
+4. `cargo clean && cargo build --release`.
+
+Windows Terminal soporta truecolor, half-blocks y WASAPI sin problemas.
+
+## Uso
 
 ```
-                    ┌──────────────┐
-                    │  fichero.mp4 │
-                    └──────┬───────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
-              ▼                         ▼
-      ┌───────────────┐         ┌──────────────┐
-      │ demux vídeo   │         │ demux audio  │
-      │ decode + sws  │         │ decode + swr │
-      │ (thread 1)    │         │ (thread 2)   │
-      └──────┬────────┘         └──────┬───────┘
-             │ RGB24                   │ f32 estéreo
-             │ bounded=2               │ bounded=64
-             ▼                         ▼
-      ┌───────────────┐         ┌──────────────┐
-      │ main loop     │         │ cpal callback│
-      │ · sync a clock│         │ (OS driver)  │
-      │ · render      │         │ · notify clock
-      │ · HUD         │         └──────┬───────┘
-      └───────────────┘                │
-                                 AudioClock
-                              (master clock)
+rtv <fichero> [opciones]
 ```
 
-## Comparación con `mpv --vo=tct` (medido con este binario)
+| Opción | Efecto |
+|---|---|
+| `--backend <kitty\|iterm2\|sixel\|blocks\|ascii>` | Fuerza un backend (por defecto se auto-detecta) |
+| `--scale <0.1..1.0>` | Limita la resolución de render. Útil en terminales 4K donde el decode software no da abasto |
+| `--loop-video` | Reinicia al llegar al final |
+| `--stats` | FPS mostrados/decodificados y drops en el HUD |
+| `--no-audio` | Sin audio; el vídeo usa reloj monotónico |
+| `--verbose` | Deja los logs de FFmpeg en stderr (debugging) |
 
-| Métrica | `mpv --vo=tct` | **rtv v0.2** |
-|---|---|---|
-| Arranque | ~150–300 ms | **~20–40 ms** |
-| SGR/celda HalfBlocks | Fg+bg por celda | **Delta-encoded** (~30-50 % menos bytes) |
-| Kitty round-trips | ACKs (`m=1`) | **`q=2`** (0 round-trips) |
-| Peso binario stripped | ~40 MB | **~1.1 MB** (FFmpeg dinámico) |
-| Reloj maestro | Audio (libmpv) | **Audio (cpal) o mono** |
-| Reescalado | Fijo por vo | **Adaptativo por celda real** |
+### Controles
 
-## Estructura del código
+| Tecla | Acción |
+|---|---|
+| `Espacio` | Pausa / reanudar (también el audio) |
+| `←` / `→` | Seek ±5 s |
+| `↑` / `↓` | Volumen ±5 (0–200 %) |
+| `q` / `Esc` / `Ctrl+C` | Salir |
+
+## Arquitectura
+
+Pipeline productor–consumidor con un hilo por etapa, comunicados por canales
+`crossbeam` acotados:
+
+```
+                 ┌──────────────┐
+                 │  fichero.mp4 │
+                 └──────┬───────┘
+                        │
+           ┌────────────┴────────────┐
+           ▼                         ▼
+   ┌───────────────┐         ┌──────────────┐
+   │ demux vídeo   │         │ demux audio  │
+   │ decode + sws  │         │ decode + swr │
+   │ (hilo 1)      │         │ (hilo 2)     │
+   └──────┬────────┘         └──────┬───────┘
+          │ RGB24                   │ f32 estéreo
+          │ cola por presupuesto    │ ring buffer
+          │ de memoria (~48 MB)     │
+          ▼                         ▼
+   ┌───────────────┐         ┌──────────────┐
+   │ loop principal│         │ callback cpal│
+   │ · sync ffplay │◄────────│ · alimenta el│
+   │ · render      │ AudioClk│   reloj audio│
+   │ · HUD e input │ (master)└──────────────┘
+   └───────────────┘
+```
+
+Piezas clave:
+
+- **`decoder.rs`** — demux + decode + `sws_scale` de vídeo. Los seeks van
+  con serial: cada seek incrementa un contador y los frames con serial viejo
+  se descartan aguas abajo. El resize es un store atómico de las dims
+  destino que el escalador lee antes de cada frame.
+- **`audio.rs`** — demux + decode + `swr_convert` de audio, ring buffer
+  lock-free hacia el callback de cpal. El callback alimenta el reloj de
+  audio con el PTS de la muestra que se está oyendo (latencia de salida
+  descontada, suavizada con EMA, con limitador de tasa contra los bursts de
+  prebuffer de PulseAudio).
+- **`clock.rs`** — relojes estilo ffplay (`FfClock`) con seriales, anclaje,
+  staleness y `compute_target_delay`.
+- **`player.rs`** — el loop: input, sync, decisión de drop/espera, render y
+  HUD. Las esperas se hacen con `event::poll`, así que cualquier tecla o
+  resize interrumpe la espera y se atiende al instante.
+- **`renderer.rs`** — los tres backends. Todos recortan a los límites
+  reales del área de vídeo, de modo que un frame con dimensiones desfasadas
+  (resize en vuelo) nunca desborda la pantalla.
+- **`terminfo.rs`** — sondeo del tamaño de celda (CSI `16t`/`14t`) con
+  timeout de 20 ms y lista blanca de terminales que responden; heurística
+  8×16 para el resto. En Windows nunca se sondea.
+
+## Estructura del repo
 
 ```
 rtv/
-├── Cargo.toml              # ffmpeg-the-third 5.0 + cpal + crossterm 0.29
-├── README.md               # este fichero
-├── BUILD-WINDOWS.md        # guía Windows detallada
-└── src/
-    ├── main.rs             # CLI + init + silenciado libav
-    ├── player.rs           # loop principal, layout adaptativo
-    ├── decoder.rs          # hilo demux+decode+sws para vídeo
-    ├── audio.rs            # hilo demux+decode+swr para audio + cpal sink
-    ├── clock.rs            # trait Clock + MonoClock + AudioClock
-    ├── renderer.rs         # Kitty / HalfBlocks / ASCII
-    ├── terminfo.rs         # detección de cell size vía CSI 16t / 14t
-    └── input.rs            # eventos crossterm no-bloqueantes
+├── Cargo.toml
+├── README.md
+├── BUILD-WINDOWS.md         # guía de build para Windows
+├── todo.md                  # notas de trabajo y plan de las tareas
+├── src/
+│   ├── main.rs              # CLI, init de FFmpeg, silenciado de logs
+│   ├── player.rs            # loop principal y sync
+│   ├── decoder.rs           # hilo de vídeo
+│   ├── audio.rs             # hilo de audio + sink cpal
+│   ├── clock.rs             # relojes ffplay-style
+│   ├── renderer.rs          # backends de render + HUD
+│   ├── terminfo.rs          # detección del tamaño de celda
+│   └── input.rs             # eventos de teclado/resize
+└── tests/
+    ├── integration_sync.py       # sync A/V + seeks, en pty real
+    ├── integration_resize.py     # tormenta de resizes + seeks + pausa
+    └── integration_resize_ux.py  # latencia de resize, parpadeo, límites
 ```
 
-## Roadmap
+## Tests
 
-- [x] Audio con cpal + swresample (v0.2)
-- [x] Escalado adaptativo por celda real (v0.2)
-- [x] HUD adaptativo (v0.2)
-- [ ] **HW decode**: VAAPI (Linux), D3D11VA (Windows), VideoToolbox (macOS).
-- [ ] **Sixel real** para xterm/mlterm.
-- [ ] **iTerm2 protocol** real (base64 + `\x1b]1337;File=`).
-- [ ] **Subtítulos** softsub (SRT/ASS) sobreimpresos.
-- [ ] Barra de progreso clicable con mouse.
+Los tests de integración ejecutan el binario release dentro de un pty real,
+le inyectan teclas, resizes (`TIOCSWINSZ` + `SIGWINCH`) y analizan tanto el
+log de sincronía (`RTV_SYNC_LOG`) como el propio stream de escape sequences
+(con [pyte](https://github.com/selectel/pyte) como emulador de terminal):
+
+```bash
+cargo build --release
+python3 tests/integration_sync.py       video.mp4
+python3 tests/integration_resize.py     video.mp4 [ascii|blocks]
+python3 tests/integration_resize_ux.py  video.mp4
+```
+
+Verifican, entre otras cosas: |avdiff| en régimen y tras cada seek, latencia
+del primer frame post-seek, supervivencia a tormentas de 60+ resizes con
+tamaños degenerados (4×3), latencia de redibujo tras resize, que ninguna
+secuencia de cursor escriba fuera de los límites del terminal y que el HUD
+no se repinte más de lo necesario.
+
+## Estado y hoja de ruta
+
+Hecho:
+
+- [x] Audio con cpal + swresample, reloj de audio maestro
+- [x] Motor de sync estilo ffplay (drop/duplicado con umbrales de ffplay)
+- [x] Seeks instantáneos con aterrizaje en keyframe y audio alineado al PTS real
+- [x] Escalado adaptativo por tamaño real de celda
+- [x] Resize en caliente instantáneo, sin perder sync ni colchón de decode
+- [x] HUD adaptativo sin parpadeo; oculto en ventanas minúsculas
+
+Pendiente:
+
+- [ ] **Decode por hardware**: VAAPI (Linux), D3D11VA (Windows),
+      VideoToolbox (macOS) — plan detallado en [`todo.md`](todo.md)
+- [ ] Sixel real para xterm/mlterm
+- [ ] Protocolo iTerm2 nativo (`ESC ] 1337 ; File=`)
+- [ ] Subtítulos softsub (SRT/ASS)
+- [ ] Barra de progreso clicable con ratón
 
 ## Licencia
 
