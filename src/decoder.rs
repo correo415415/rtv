@@ -189,6 +189,12 @@ pub struct DecoderHandle {
 pub struct SeekReq {
     pub target_secs: f64,
     pub serial: i32,
+    /// Seek de REFINADO (post-resize): el decoder descarta los frames
+    /// del GOP hasta pts >= target (hr-seek exacto) en vez de emitir
+    /// desde el keyframe. El player NO toca relojes ni audio: la
+    /// reproducción continúa y solo cambia la resolución de los
+    /// frames que llegan.
+    pub refine: bool,
 }
 
 impl DecoderHandle {
@@ -205,6 +211,29 @@ impl DecoderHandle {
         let _ = self.seek_tx.send(SeekReq {
             target_secs,
             serial: new_serial,
+            refine: false,
+        });
+        new_serial
+    }
+
+    /// Re-decodifica desde `target_secs` con las dims destino VIGENTES
+    /// (refinado de calidad tras agrandar la terminal). A diferencia
+    /// de `seek()`:
+    ///   * el decoder DESCARTA los frames del GOP hasta pts >= target
+    ///     (aterrizaje exacto, no en el keyframe) → sin salto visual
+    ///     hacia atrás;
+    ///   * el player no toca relojes ni audio — el sonido sigue y los
+    ///     frames nítidos entran en cuanto alcanzan al reloj maestro.
+    /// La cola se drena: contenía hasta ~2.5 s de frames escalados a
+    /// las dims viejas (pequeñas), que upscaleados se veían borrosos
+    /// — el "tarda en volver la calidad buena" al agrandar.
+    pub fn refine_at(&self, target_secs: f64) -> i32 {
+        let new_serial = self.serial.fetch_add(1, Ordering::AcqRel) + 1;
+        while self.rx.try_recv().is_ok() {}
+        let _ = self.seek_tx.send(SeekReq {
+            target_secs,
+            serial: new_serial,
+            refine: true,
         });
         new_serial
     }
@@ -361,6 +390,11 @@ fn decode_loop(
     // ¿Hemos llegado a EOF? En vez de matar el hilo, lo "aparcamos"
     // esperando un seek (necesario para seeks tras el final y --loop).
     let mut at_eof = false;
+    // Umbral de descarte para seeks de REFINADO: los frames con
+    // pts < drop_until no se emiten (aterrizaje exacto en el punto
+    // actual de reproducción, sin salto atrás al keyframe). El sws
+    // se salta para los descartados — solo se paga el decode.
+    let mut drop_until: Option<f64> = None;
 
     'outer: loop {
         if stop.load(Ordering::Relaxed) {
@@ -396,6 +430,10 @@ fn decode_loop(
                 (req.target_secs * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
             let _ = ictx.seek(ts_target, ..=ts_target);
             decoder.flush();
+            // Refinado: descartar hasta el punto exacto (1 ms de
+            // tolerancia por redondeo de PTS). Seek normal: emitir
+            // desde el keyframe (salto instantáneo estilo mpv).
+            drop_until = if req.refine { Some(req.target_secs) } else { None };
             // Seek a keyframe (mpv-style): NO descartamos frames hasta
             // el target. El primer frame decodificado (el keyframe
             // <= target) SE EMITE tal cual → salto de golpe. El player
@@ -433,6 +471,7 @@ fn decode_loop(
                     tb_den,
                     current_serial,
                     &serial_atomic,
+                    &mut drop_until,
                 );
                 eof.store(true, Ordering::Relaxed);
                 // NO salimos del hilo: nos aparcamos esperando un
@@ -456,6 +495,15 @@ fn decode_loop(
 
             let pts_ticks = frame.pts().unwrap_or(0);
             let pts_secs = pts_ticks as f64 * tb_num / tb_den;
+
+            // Refinado en curso: descartar los frames del GOP previos
+            // al punto actual de reproducción (no re-emitir el pasado).
+            if let Some(t) = drop_until {
+                if pts_secs < t - 0.001 {
+                    continue;
+                }
+                drop_until = None;
+            }
 
             // Leer las dims destino MÁS RECIENTES justo antes de
             // escalar: el resize se aplica al mismísimo siguiente
@@ -541,6 +589,7 @@ fn drain(
     tb_den: f64,
     current_serial: i32,
     serial_atomic: &Arc<AtomicI32>,
+    drop_until: &mut Option<f64>,
 ) {
     while decoder.receive_frame(frame).is_ok() {
         if stop.load(Ordering::Relaxed) {
@@ -551,6 +600,12 @@ fn drain(
         }
         let pts_ticks = frame.pts().unwrap_or(0);
         let pts_secs = pts_ticks as f64 * tb_num / tb_den;
+        if let Some(t) = *drop_until {
+            if pts_secs < t - 0.001 {
+                continue;
+            }
+            *drop_until = None;
+        }
         let (dst_w, dst_h) = unpack_dims(target_dims.load(Ordering::Acquire));
         let out = match scaler.scale(frame, dst_w, dst_h) {
             Some(rgb) => build_rgb_frame(rgb, pts_secs, current_serial),
