@@ -85,19 +85,79 @@ Objetivo: que el resize de la terminal NO afecte a la reproducción (hoy crashea
     [x] decoder.rs: struct Scaler { sws, rgb, in/out dims+fmt } — reconstruye contexto Y frame
         de salida juntos si CUALQUIER dim cambia; en error resetea a None (se reconstruye en la
         siguiente llamada). Nunca queda en estado roto → fix definitivo del OutputChanged.
-    [ ] decoder.rs: reescribir decode_loop() con la nueva firma (sin dst_w0/dst_h0/resize_rx),
+    [x] decoder.rs: reescribir decode_loop() con la nueva firma (sin dst_w0/dst_h0/resize_rx),
         leyendo target_dims por frame y escalando con Scaler; actualizar drain() igual.
-    [ ] renderer.rs: recorte a los límites de la terminal en TODOS los backends (halfblocks/
+    [x] renderer.rs: recorte a los límites de la terminal en TODOS los backends (halfblocks/
         ascii/kitty) y tolerancia a frames con dims que no cuadran con el layout actual.
-    [ ] player.rs: recomputar layout por frame, cachear el último frame mostrado para redibujo
+    [x] player.rs: recomputar layout por frame, cachear el último frame mostrado para redibujo
         instantáneo en el resize, dims mínimas para terminales diminutas, y NO tocar los relojes
         ni el sync en ningún caso durante el resize.
-    [ ] Test de integración de resize: tormenta de TIOCSWINSZ sobre el pty durante la
+    [x] Test de integración de resize: tormenta de TIOCSWINSZ sobre el pty durante la
         reproducción → sin crash, fps estable, sync-log limpio; re-ejecutar el test de sync para
         confirmar cero regresiones.
-    [ ] Commit + PR completo del trabajo de resize.
+    [x] Commit + PR completo del trabajo de resize.
 
-## Estado actual
+## ✅ Hecho (esta sesión) — Tarea 2 COMPLETADA
 
-    src/decoder.rs a medio refactor (target_dims + Scaler ya aplicados; decode_loop()/drain()
-    pendientes de reescribir — la rama no compila hasta terminar ese paso).
+    decoder.rs — resize atómico:
+      * `target_dims: Arc<AtomicU64>` (w<<32|h). `resize()` = un solo store atómico:
+        sin canal (nunca se pierden eventos), sin drenar la cola de pre-decode (el
+        colchón de ~2.5 s se conserva), coalescencia automática en tormentas (el
+        decoder siempre lee el ÚLTIMO valor por frame, justo antes de escalar).
+      * `struct Scaler`: SwsCtx + frame RGB de salida como UNIDAD — se reconstruyen
+        JUNTOS si cambia cualquier dim/formato de entrada o salida. Fix definitivo
+        del `Error::OutputChanged` (reutilizar el frame viejo con un contexto nuevo
+        rompía TODOS los run() posteriores → decoder mudo → "crashea todo").
+        En error se resetea a None y se reconstruye limpio en la llamada siguiente.
+      * `unpack_dims` clampa a mínimo 2×2: jamás dims degeneradas a sws_scale.
+      * decode_loop()/drain() reescritos con la nueva firma (sin dst_w0/dst_h0 ni
+        resize_rx): leen target_dims por frame y escalan con el Scaler.
+
+    renderer.rs — recorte a límites de terminal:
+      * `draw()` recibe el área útil (cols × filas SIN el HUD) y clampa offsets.
+      * halfblocks: recorta filas de celdas (1×2 px) y columnas visibles.
+      * ascii: recorta filas/columnas (1×1 px).
+      * kitty: recorta en PÍXELES al área útil (sub-rectángulo del RGB antes del
+        base64, con `set_cell_px` para saber los px/celda) — la imagen ya no pisa
+        el HUD ni provoca scroll con frames de dims viejas.
+      * Sanity check `data.len() >= h*stride` en todos los backends (frames
+        corruptos/incompletos no pintan en vez de panic).
+
+    player.rs — resize sin tocar el motor de sync:
+      * `offsets_for_frame()`: el layout (centrado) se recalcula POR FRAME con las
+        dims REALES del frame — durante un resize conviven frames viejos y nuevos
+        y cada uno se centra/recorta bien. Adiós col_ox/row_oy cacheados obsoletos.
+      * `last_frame` cacheado (move, coste cero): al Cmd::Resize se redibuja YA el
+        último frame (recortado si hace falta) → respuesta instantánea incluso en
+        pausa/hold, sin esperar al siguiente frame del decoder.
+      * Cmd::Resize NO toca relojes, ni seriales, ni frame_timer, ni la cola.
+      * Dims mínimas cols>=4 rows>=3 (ya existente) + área de vídeo = rows − HUD.
+
+    tests/integration_resize.py (nuevo):
+      * Tormenta de 30+ TIOCSWINSZ+SIGWINCH (tamaños aleatorios 4×3..300×90, casos
+        límite explícitos, ráfagas back-to-back sin sleep), seeks EN MEDIO de la
+        tormenta, pausa+resize+resume, y salida limpia con `q`.
+      * Verifica: proceso vivo y exit 0, continuidad (ningún gap >3 s; ≤3 gaps de
+        1.5–3 s = pausa+holds de seek), fps post-tormenta ≥10, |avdiff| mediana
+        post-tormenta <60 ms. Parametrizado por backend (ascii/blocks/kitty).
+      * Lector continuo del pty en un hilo: sin él, el buffer del pty (64 KB) se
+        llenaba con la salida de blocks/kitty y rtv se bloqueaba en write() —
+        latencia del HARNESS que contaminaba la medición, no del reproductor.
+
+📊 Resultados (vídeo dQw4w9WgXcQ 4K AV1, sandbox 2 cores + PulseAudio null sink)
+Métrica                                  Antes           Ahora           Umbral
+Resize durante reproducción              crash/freeze    0 crashes       sin crash
+Tormenta 30+ resizes (3 backends)        —               PASS ascii/blocks/kitty
+fps post-tormenta (ascii)                —               25.2 (nominal 25)  >=10
+|avdiff| mediana post-tormenta           —               0.0–10.8 ms     <60 ms
+Arranque en terminal 5×4 + extremos      no arrancaba    OK, exit 0      —
+integration_resize.py (ascii, 3 runs)    —               3/3 PASS        —
+integration_sync.py (regresión, 2 runs)  —               2/2 PASS        —
+Unit tests                               —               8/8 PASS        —
+
+🔜 Pendiente (opcional)
+
+    Re-sondear el cell size (CSI 16t) al cambiar de monitor con distinto DPI
+    (hoy se cachea al arrancar; el HUD lo indica con "heur/csi16").
+    Limpieza: warnings menores (métodos no usados en MasterClock).
+    Probar en terminal real (kitty/wezterm) con sink de audio físico.

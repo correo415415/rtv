@@ -6,6 +6,19 @@
 //!     letterbox "roto").
 //!   * `reset_layout_cache` para forzar clear al resize/seek.
 //!   * Los píxeles/celda vienen del `CellPx` detectado, no fijos.
+//!
+//! Cambios v0.6 (resize robusto):
+//!   * **Recorte a los límites de la terminal en TODOS los backends**:
+//!     durante un resize llegan frames con dims "viejas" (más grandes
+//!     que la terminal recién encogida) — antes se escribían fuera de
+//!     pantalla → basura visual, scroll fantasma y pánicos. Ahora
+//!     `draw()` recibe el área útil (cols × filas sin el HUD) y cada
+//!     backend recorta filas y columnas que no caben. Los frames con
+//!     dims desfasadas se muestran recortados durante los ~1-2 frames
+//!     que tarda el decoder en aplicar las dims nuevas — sin perder
+//!     el colchón de pre-decode ni el sync.
+//!   * `set_cell_px` para que el recorte de Kitty sepa cuántos
+//!     píxeles ocupa cada celda.
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -111,6 +124,13 @@ pub struct Renderer {
     scratch: Vec<u8>,
     b64: String,
     last_layout: Option<(u16, u16, u32, u32, u32, u32)>,
+    /// Píxeles por celda del terminal (solo relevante para Kitty:
+    /// halfblocks es 1×2 y ascii 1×1 implícitos). Se usa para el
+    /// recorte a los límites de la terminal.
+    cell_px_w: u32,
+    cell_px_h: u32,
+    /// Buffer de recorte para Kitty (crop del RGB antes del base64).
+    crop_buf: Vec<u8>,
 }
 
 impl Renderer {
@@ -120,25 +140,48 @@ impl Renderer {
             scratch: Vec::with_capacity(1 << 20),
             b64: String::with_capacity(1 << 20),
             last_layout: None,
+            cell_px_w: 8,
+            cell_px_h: 16,
+            crop_buf: Vec::new(),
         }
+    }
+
+    /// Informa al renderer del tamaño de celda en píxeles (para el
+    /// recorte del backend Kitty). Llamar al arrancar y tras resize
+    /// si el cell size cambia.
+    pub fn set_cell_px(&mut self, w: u32, h: u32) {
+        self.cell_px_w = w.max(1);
+        self.cell_px_h = h.max(1);
     }
 
     pub fn reset_layout_cache(&mut self) {
         self.last_layout = None;
     }
 
+    /// Dibuja `frame` con su esquina superior izquierda en la celda
+    /// (col_ox, row_oy), RECORTANDO a un área útil de `max_cols` ×
+    /// `max_rows` celdas (el área del terminal sin el HUD). Tolera
+    /// frames con dims que no cuadran con el layout actual (resize en
+    /// vuelo): se pintan recortados en vez de desbordar la pantalla.
     pub fn draw<W: Write>(
         &mut self,
         out: &mut W,
         frame: &RgbFrame,
-        term_cols: u16,
-        term_rows: u16,
+        max_cols: u16,
+        max_rows: u16,
         col_ox: u16,
         row_oy: u16,
     ) -> Result<()> {
+        if max_cols == 0 || max_rows == 0 || frame.width == 0 || frame.height == 0 {
+            return Ok(());
+        }
+        // Offsets clampeados al área útil.
+        let col_ox = col_ox.min(max_cols.saturating_sub(1));
+        let row_oy = row_oy.min(max_rows.saturating_sub(1));
+
         let layout = (
-            term_cols,
-            term_rows,
+            max_cols,
+            max_rows,
             frame.width,
             frame.height,
             col_ox as u32,
@@ -152,11 +195,11 @@ impl Renderer {
         }
 
         match self.backend {
-            Backend::Kitty => self.draw_kitty(out, frame, col_ox, row_oy),
+            Backend::Kitty => self.draw_kitty(out, frame, max_cols, max_rows, col_ox, row_oy),
             Backend::HalfBlocks | Backend::Iterm2 | Backend::Sixel => {
-                self.draw_halfblocks(out, frame, col_ox, row_oy)
+                self.draw_halfblocks(out, frame, max_cols, max_rows, col_ox, row_oy)
             }
-            Backend::Ascii => self.draw_ascii(out, frame, col_ox, row_oy),
+            Backend::Ascii => self.draw_ascii(out, frame, max_cols, max_rows, col_ox, row_oy),
         }
     }
 
@@ -164,6 +207,8 @@ impl Renderer {
         &mut self,
         out: &mut W,
         frame: &RgbFrame,
+        max_cols: u16,
+        max_rows: u16,
         col_ox: u16,
         row_oy: u16,
     ) -> Result<()> {
@@ -171,12 +216,18 @@ impl Renderer {
         let h = frame.height as usize;
         let stride = w * 3;
         let data = &frame.data;
+        if data.len() < h * stride {
+            return Ok(()); // frame corrupto/incompleto: no pintar
+        }
 
         self.scratch.clear();
         let mut last_fg: (u8, u8, u8) = (255, 255, 255);
         let mut last_bg: (u8, u8, u8) = (0, 0, 0);
 
-        let rows = h / 2;
+        // Recorte: filas de celdas y columnas visibles dentro del
+        // área útil. 1 celda = 1×2 px en halfblocks.
+        let rows = (h / 2).min((max_rows - row_oy) as usize);
+        let vis_w = w.min((max_cols - col_ox) as usize);
         for cy in 0..rows {
             let term_row = row_oy as usize + cy + 1;
             let term_col = col_ox as usize + 1;
@@ -188,7 +239,7 @@ impl Renderer {
             let row_top = &data[y_top * stride..y_top * stride + stride];
             let row_bot = &data[y_bot * stride..y_bot * stride + stride];
 
-            for x in 0..w {
+            for x in 0..vis_w {
                 let i = x * 3;
                 let fg = (row_top[i], row_top[i + 1], row_top[i + 2]);
                 let bg = (row_bot[i], row_bot[i + 1], row_bot[i + 2]);
@@ -214,9 +265,39 @@ impl Renderer {
         &mut self,
         out: &mut W,
         frame: &RgbFrame,
+        max_cols: u16,
+        max_rows: u16,
         col_ox: u16,
         row_oy: u16,
     ) -> Result<()> {
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let stride = w * 3;
+        if frame.data.len() < h * stride {
+            return Ok(());
+        }
+
+        // Recorte en PÍXELES al área útil: si el frame (dims viejas
+        // durante un resize) no cabe, mandamos solo el sub-rectángulo
+        // visible. Sin esto la imagen desbordaba el área de vídeo y
+        // pisaba el HUD / provocaba scroll.
+        let avail_px_w = (max_cols - col_ox) as usize * self.cell_px_w as usize;
+        let avail_px_h = (max_rows - row_oy) as usize * self.cell_px_h as usize;
+        let vis_w = w.min(avail_px_w).max(1);
+        let vis_h = h.min(avail_px_h).max(1);
+
+        let payload: &[u8] = if vis_w == w && vis_h == h {
+            &frame.data
+        } else {
+            self.crop_buf.clear();
+            self.crop_buf.reserve(vis_w * vis_h * 3);
+            for y in 0..vis_h {
+                let s = y * stride;
+                self.crop_buf.extend_from_slice(&frame.data[s..s + vis_w * 3]);
+            }
+            &self.crop_buf
+        };
+
         self.scratch.clear();
         write!(
             &mut self.scratch,
@@ -228,7 +309,7 @@ impl Renderer {
         self.scratch.extend_from_slice(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
 
         self.b64.clear();
-        B64.encode_string(&frame.data, &mut self.b64);
+        B64.encode_string(payload, &mut self.b64);
 
         let bytes = self.b64.as_bytes();
         const CHUNK: usize = 4096;
@@ -242,7 +323,7 @@ impl Renderer {
                 write!(
                     &mut self.scratch,
                     "\x1b_Ga=T,f=24,s={},v={},q=2,m={};",
-                    frame.width, frame.height, m
+                    vis_w, vis_h, m
                 )?;
                 first = false;
             } else {
@@ -260,6 +341,8 @@ impl Renderer {
         &mut self,
         out: &mut W,
         frame: &RgbFrame,
+        max_cols: u16,
+        max_rows: u16,
         col_ox: u16,
         row_oy: u16,
     ) -> Result<()> {
@@ -267,8 +350,14 @@ impl Renderer {
         let w = frame.width as usize;
         let h = frame.height as usize;
         let stride = w * 3;
+        if frame.data.len() < h * stride {
+            return Ok(());
+        }
         self.scratch.clear();
-        for cy in 0..h {
+        // Recorte: 1 celda = 1×1 px en ascii.
+        let vis_h = h.min((max_rows - row_oy) as usize);
+        let vis_w = w.min((max_cols - col_ox) as usize);
+        for cy in 0..vis_h {
             write!(
                 &mut self.scratch,
                 "\x1b[{};{}H",
@@ -276,7 +365,7 @@ impl Renderer {
                 col_ox as usize + 1
             )?;
             let row = &frame.data[cy * stride..cy * stride + stride];
-            for x in 0..w {
+            for x in 0..vis_w {
                 let i = x * 3;
                 let l = (row[i] as u32 * 299 + row[i + 1] as u32 * 587 + row[i + 2] as u32 * 114)
                     / 1000;
