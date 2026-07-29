@@ -161,3 +161,103 @@ Unit tests                               —               8/8 PASS        —
     (hoy se cachea al arrancar; el HUD lo indica con "heur/csi16").
     Limpieza: warnings menores (métodos no usados en MasterClock).
     Probar en terminal real (kitty/wezterm) con sink de audio físico.
+
+---
+
+# Tarea 3 (COMPLETADA): resize instantáneo + HUD sin parpadeo ni basura (PR #8)
+
+    [x] input.rs: wait_event() — esperas del player interrumpibles por eventos
+        (event::poll bloqueante). El frame en vuelo vuelve a `pending` y el
+        frame_timer se retrocede → un resize se atiende en <1 ms sin romper sync.
+    [x] input.rs: coalescencia de eventos Resize en poll_command() (solo el último).
+    [x] player.rs: rescale_frame_nearest() — frames con dims viejas (cola de
+        pre-decode y frame cacheado) se reescalan player-side (nearest + LUT)
+        a las dims nuevas → respuesta visual inmediata al encoger Y al agrandar.
+    [x] player.rs: TerminalGuard desactiva el autowrap (DECAWM, ESC[?7l) al entrar
+        y lo restaura al salir — imposible el scroll fantasma que causaba el
+        "parpadeo masivo + texto basura" en terminales pequeñas.
+    [x] renderer.rs: HUD truncado/rellenado por anchura REAL en celdas
+        (unicode-width) — los emojis 🔊/🔇 miden 2 celdas y desbordaban `cols`.
+    [x] player.rs: caché de HUD (solo se reescribe al cambiar el texto, ~1/s
+        en vez de 25-60/s) + sin ESC[2K (el padding cubre la fila) + HUD oculto
+        en terminales minúsculas (<16 cols o <5 filas).
+    [x] tests/integration_resize_ux.py (pty + pyte): latencia p95 de redibujo
+        post-resize <250 ms (medido ~1 ms), 0 posiciones de cursor fuera de
+        límites en 12×4, HUD ≤4 escrituras/s (medido 1/s), HUD oculto y vídeo
+        presente en minúscula, recuperación al agrandar, salida limpia.
+
+---
+
+# Tarea 4 (PLAN — sin empezar): decode por hardware (VAAPI / D3D11VA / VideoToolbox)
+
+Objetivo: descargar el decode de vídeo a la GPU cuando exista un hwaccel
+disponible, con fallback transparente a software. Caso motivador: AV1/HEVC 4K,
+que hoy satura los cores en decode software y limita fps/resolución de render.
+
+## Fase 0 — Investigación y decisiones de diseño
+
+    [ ] Inventariar qué expone ffmpeg-the-third 5.0 del API de hwaccel de FFmpeg:
+        av_hwdevice_ctx_create, AVCodecContext.hw_device_ctx, av_hwframe_transfer_data,
+        AVPixelFormat negotiation (get_format callback). Verificar si hay bindings
+        seguros o si toca unsafe con ffmpeg_the_third::sys directamente.
+    [ ] Decidir la matriz de hwaccels por plataforma y orden de preferencia:
+          Linux:   VAAPI (Intel/AMD) → CUDA/NVDEC (NVIDIA) → software
+          Windows: D3D11VA → DXVA2 (legacy) → software
+          macOS:   VideoToolbox → software
+    [ ] Decidir la estrategia de descarga de frames: siempre transferir a RAM
+        (av_hwframe_transfer_data → NV12) y convertir NV12→RGB24 con sws, porque
+        el destino final es el terminal (CPU). Documentar el coste del copy-back
+        y por qué NO interesa zero-copy (no hay GPU en el sink).
+    [ ] Medir baseline de rendimiento software (fps decode, uso de CPU, W) con
+        el vídeo de referencia (dQw4w9WgXcQ 4K AV1) para comparar después.
+    [ ] Investigar disponibilidad de hw decode AV1 (solo GPUs recientes: Intel
+        Xe/Arc, AMD RDNA2+, NVIDIA RTX 30+) y definir el fallback por codec.
+
+## Fase 1 — Infraestructura de dispositivo hw
+
+    [ ] Módulo nuevo src/hwdec.rs: enumeración de hwaccels disponibles en runtime
+        (av_hwdevice_iterate_types), creación del hw_device_ctx con manejo de
+        errores (dispositivo ocupado, sin permisos /dev/dri, headless).
+    [ ] CLI: --hwdec <auto|none|vaapi|d3d11va|videotoolbox|cuda> (default: auto)
+        y mostrar el hwaccel activo en el HUD junto al backend de render.
+    [ ] Selección del decoder: probar hwaccel elegido con el codec del stream;
+        si get_format no ofrece el pix_fmt hw o falla la creación → log claro
+        (con --verbose) y fallback a software SIN abortar.
+
+## Fase 2 — Integración en el pipeline de decode
+
+    [ ] decoder.rs: get_format callback para elegir el AV_PIX_FMT del hwaccel;
+        mantener thread_count=0 para el fallback software (los hwaccel no usan
+        frame threading — ajustar según camino activo).
+    [ ] decoder.rs: tras receive_frame, si frame.format() es hw → transfer a
+        frame NV12 en RAM (reutilizar buffer, no alocar por frame) y pasar ese
+        frame al Scaler; si es sw → camino actual sin cambios.
+    [ ] Scaler: aceptar NV12 como entrada (ya soporta cambio de in_fmt en
+        caliente, verificar que sws NV12→RGB24 elige el fast path SIMD).
+    [ ] Robustez: si el decode hw falla A MITAD de stream (reset de driver,
+        cambio de resolución mid-stream no soportado) → reabrir el decoder en
+        software desde el último keyframe, sin romper seriales ni el sync.
+    [ ] Verificar interacción con seeks (flush del decoder hw) y con el resize
+        (las dims destino no cambian el camino de decode, solo el sws de salida).
+
+## Fase 3 — Validación
+
+    [ ] Test de integración: reproducir con --hwdec auto y --hwdec none y
+        comparar sync-log (mismos umbrales de avdiff) + fps decode ≥ baseline.
+    [ ] Test de fallback: --hwdec vaapi en un entorno sin /dev/dri debe caer a
+        software con exit 0 y sin ensuciar el TUI (el sandbox de CI vale como
+        entorno negativo; el camino positivo requiere GPU real).
+    [ ] Test de estrés: seeks en ráfaga + tormenta de resizes con hwdec activo
+        (reusar integration_resize.py e integration_sync.py parametrizados).
+    [ ] Medir y documentar en el README: CPU% y fps con/sin hwdec en al menos
+        una máquina con GPU real (fuera del sandbox).
+    [ ] Actualizar README (matriz de soporte por SO/GPU/codec) y BUILD-WINDOWS.md
+        (D3D11VA no necesita libs extra; VAAPI necesita libva-dev en build).
+
+Riesgos conocidos:
+    * ffmpeg-the-third puede no exponer get_format de forma segura → unsafe
+      controlado en hwdec.rs, aislado del resto.
+    * El copy-back GPU→RAM puede comerse parte de la ganancia con PCIe lento;
+      por eso la Fase 0 exige medir antes de comprometerse.
+    * AV1 hw decode escasea; el default `auto` debe degradar por codec, no
+      globalmente (p.ej. VAAPI para HEVC pero software para AV1 en una iGPU vieja).
