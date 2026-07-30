@@ -35,10 +35,15 @@ use std::time::Duration;
 
 use crate::clock::FfClock;
 
-/// Petición de seek al hilo audio-decoder: target + serial nuevo.
-struct SeekMsg {
-    target_secs: f64,
-    serial: i32,
+/// Mensajes de control al hilo audio-decoder.
+enum AudioMsg {
+    /// Seek: target + serial nuevo.
+    Seek { target_secs: f64, serial: i32 },
+    /// Cambio de pista en runtime: stream del contenedor + punto de
+    /// reproducción actual. El hilo reabre el decoder sobre el stream
+    /// nuevo, recrea el resampler y aterriza en `at_secs` con recorte
+    /// sample-accurate — mismo mecanismo que un seek.
+    Switch { stream_index: usize, at_secs: f64, serial: i32 },
 }
 
 /// Bloque de muestras con serial + PTS del primer sample.
@@ -54,11 +59,15 @@ struct AudioChunk {
 pub struct AudioHandle {
     stop: Arc<AtomicBool>,
     volume: Arc<AtomicU8>,
-    seek_tx: Sender<SeekMsg>,
+    msg_tx: Sender<AudioMsg>,
     pub clock: Arc<FfClock>,
     pub has_audio: bool,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Índice del stream de audio con el que ARRANCÓ el pipeline
+    /// (best o el pedido por --aid/--alang). Informativo: el player
+    /// lo usa para posicionar el ciclado de pistas.
+    pub track_index: Option<usize>,
     decoder_join: Option<thread::JoinHandle<()>>,
     pub stream: Option<cpal::Stream>,
 }
@@ -87,8 +96,21 @@ impl AudioHandle {
         // DESCARTAR el último seek de una ráfaga (→→→←←) y dejar el
         // audio aterrizado en un target distinto del vídeo → offset
         // A/V constante de ±5 s tras la ráfaga.
-        let _ = self.seek_tx.send(SeekMsg {
+        let _ = self.msg_tx.send(AudioMsg::Seek {
             target_secs,
+            serial,
+        });
+    }
+
+    /// Cambia la pista de audio EN CALIENTE. El player debe haber
+    /// bumpeado los seriales (`master.set(now)`) ANTES de llamar —
+    /// igual que con `seek` — para que los chunks de la pista vieja
+    /// que sigan en el ring se silencien y no toquen el reloj.
+    pub fn switch_track(&self, stream_index: usize, at_secs: f64) {
+        let serial = self.clock.current_serial();
+        let _ = self.msg_tx.send(AudioMsg::Switch {
+            stream_index,
+            at_secs,
             serial,
         });
     }
@@ -142,24 +164,28 @@ impl Drop for AudioHandle {
     }
 }
 
-pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle> {
+/// `start_track`: índice del stream de audio del contenedor con el
+/// que arrancar (de `--aid`/`--alang`); `None` = pista "best" de
+/// FFmpeg. Si el índice no es un stream de audio válido se cae a
+/// "best" silenciosamente.
+pub fn spawn<P: AsRef<Path>>(
+    path: P,
+    clock: Arc<FfClock>,
+    start_track: Option<usize>,
+) -> Result<AudioHandle> {
     let path = path.as_ref().to_owned();
 
     let ictx = input(&path).with_context(|| format!("abriendo {:?}", path))?;
-    let audio_stream = ictx.streams().best(MediaType::Audio);
-    if audio_stream.is_none() {
-        return Ok(no_audio(clock));
-    }
-    let audio_idx = audio_stream.as_ref().unwrap().index();
-    let codec_params: ffmpeg::codec::Parameters = {
-        let src_ref = audio_stream.as_ref().unwrap().parameters();
-        let mut owned = ffmpeg::codec::Parameters::new();
-        unsafe {
-            ffmpeg::sys::avcodec_parameters_copy(owned.as_mut_ptr(), src_ref.as_ptr());
-        }
-        owned
+    let requested = start_track.filter(|&i| {
+        ictx.stream(i)
+            .map(|s| s.parameters().medium() == MediaType::Audio)
+            .unwrap_or(false)
+    });
+    let audio_idx = match requested.or_else(|| ictx.streams().best(MediaType::Audio).map(|s| s.index()))
+    {
+        Some(i) => i,
+        None => return Ok(no_audio(clock)),
     };
-    let time_base = audio_stream.as_ref().unwrap().time_base();
     drop(ictx);
 
     let host = cpal::default_host();
@@ -187,27 +213,22 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
 
     let stop = Arc::new(AtomicBool::new(false));
     let volume = Arc::new(AtomicU8::new(100));
-    let (seek_tx, seek_rx) = unbounded::<SeekMsg>();
+    let (msg_tx, msg_rx) = unbounded::<AudioMsg>();
 
     let decoder_join = {
         let stop = stop.clone();
         let path2 = path.clone();
-        let tb_num = f64::from(time_base.numerator());
-        let tb_den = f64::from(time_base.denominator());
         thread::Builder::new()
             .name("rtv-audio-decoder".into())
             .spawn(move || {
                 let _ = audio_decode_loop(
                     path2,
                     audio_idx,
-                    codec_params,
-                    tb_num,
-                    tb_den,
                     out_sample_rate,
                     out_channels,
                     samples_tx,
                     samples_rx_for_drain,
-                    seek_rx,
+                    msg_rx,
                     stop,
                 );
             })?
@@ -437,11 +458,12 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
     Ok(AudioHandle {
         stop,
         volume,
-        seek_tx,
+        msg_tx,
         clock,
         has_audio,
         sample_rate: out_sample_rate,
         channels: out_channels,
+        track_index: Some(audio_idx),
         decoder_join: Some(decoder_join),
         stream,
     })
@@ -449,37 +471,108 @@ pub fn spawn<P: AsRef<Path>>(path: P, clock: Arc<FfClock>) -> Result<AudioHandle
 
 fn no_audio(clock: Arc<FfClock>) -> AudioHandle {
     let stop = Arc::new(AtomicBool::new(true));
-    let (seek_tx, _seek_rx) = bounded::<SeekMsg>(1);
+    let (msg_tx, _msg_rx) = bounded::<AudioMsg>(1);
     AudioHandle {
         stop,
         volume: Arc::new(AtomicU8::new(100)),
-        seek_tx,
+        msg_tx,
         clock,
         has_audio: false,
         sample_rate: 48000,
         channels: 2,
+        track_index: None,
         decoder_join: None,
         stream: None,
     }
+}
+
+/// Estado del decode de UNA pista de audio (decoder + resampler +
+/// parámetros de entrada). Se reconstruye entero al cambiar de pista
+/// en runtime: cada pista puede tener codec, sample_rate y layout
+/// distintos — el resampler siempre normaliza al formato FIJO del
+/// sink cpal (f32 interleaved, out_sample_rate, out_channels), así
+/// que el stream de salida NO se toca.
+struct TrackState {
+    decoder: ffmpeg::decoder::Audio,
+    tb_num: f64,
+    tb_den: f64,
+    in_sample_rate: u32,
+    in_ch_layout_raw: ffmpeg::sys::AVChannelLayout,
+    in_format: SampleFormat,
+    swr: SwrCtx,
+}
+
+fn mk_out_layout(out_channels: u16) -> ChannelLayout<'static> {
+    if out_channels == 1 {
+        ChannelLayout::MONO
+    } else {
+        ChannelLayout::STEREO
+    }
+}
+
+fn open_track(
+    ictx: &ffmpeg::format::context::Input,
+    stream_idx: usize,
+    out_channels: u16,
+    out_sample_rate: u32,
+) -> Result<TrackState> {
+    let stream = ictx
+        .stream(stream_idx)
+        .ok_or_else(|| anyhow!("stream {stream_idx} no existe"))?;
+    if stream.parameters().medium() != MediaType::Audio {
+        return Err(anyhow!("stream {stream_idx} no es de audio"));
+    }
+    // Copia DUEÑA de los parámetros (desligada del borrow de ictx).
+    let codec_params: ffmpeg::codec::Parameters = {
+        let src_ref = stream.parameters();
+        let mut owned = ffmpeg::codec::Parameters::new();
+        unsafe {
+            ffmpeg::sys::avcodec_parameters_copy(owned.as_mut_ptr(), src_ref.as_ptr());
+        }
+        owned
+    };
+    let tb = stream.time_base();
+    let dec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)?;
+    let decoder = dec_ctx.decoder().audio()?;
+    let in_sample_rate = decoder.rate();
+    let in_ch_layout_raw: ffmpeg::sys::AVChannelLayout =
+        decoder.ch_layout().to_owned().into_owned();
+    let in_format: SampleFormat = decoder.format();
+    let swr = SwrCtx::get2(
+        in_format,
+        ChannelLayout::from(&in_ch_layout_raw),
+        in_sample_rate,
+        SampleFormat::F32(SampleType::Packed),
+        mk_out_layout(out_channels),
+        out_sample_rate,
+    )
+    .map_err(|e| anyhow!("swresample init: {e}"))?;
+    Ok(TrackState {
+        decoder,
+        tb_num: f64::from(tb.numerator()),
+        tb_den: f64::from(tb.denominator()),
+        in_sample_rate,
+        in_ch_layout_raw,
+        in_format,
+        swr,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn audio_decode_loop(
     path: PathBuf,
     audio_idx: usize,
-    codec_params: ffmpeg::codec::Parameters,
-    tb_num: f64,
-    tb_den: f64,
     out_sample_rate: u32,
     out_channels: u16,
     samples_tx: Sender<AudioChunk>,
     samples_rx_for_drain: Receiver<AudioChunk>,
-    seek_rx: Receiver<SeekMsg>,
+    msg_rx: Receiver<AudioMsg>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut ictx = input(&path)?;
-    let dec_ctx = ffmpeg::codec::context::Context::from_parameters(codec_params)?;
-    let mut decoder = dec_ctx.decoder().audio()?;
+    // Índice de la pista ACTIVA (cambia con AudioMsg::Switch).
+    let mut active_idx = audio_idx;
+    let mut ts = open_track(&ictx, active_idx, out_channels, out_sample_rate)?;
 
     // Log de depuración del hilo decoder (RTV_AUDIO_DEC_DEBUG=/ruta).
     let mut dec_log: Option<std::io::BufWriter<std::fs::File>> =
@@ -487,32 +580,6 @@ fn audio_decode_loop(
             std::fs::File::create(p).ok().map(std::io::BufWriter::new)
         });
     let dec_origin = std::time::Instant::now();
-
-    let in_sample_rate = decoder.rate();
-    // AVChannelLayout DUEÑO (desligado del borrow del decoder) para
-    // poder recrear el resampler tras cada seek.
-    let in_ch_layout_raw: ffmpeg::sys::AVChannelLayout =
-        decoder.ch_layout().to_owned().into_owned();
-    let in_format: SampleFormat = decoder.format();
-
-    let out_format = SampleFormat::F32(SampleType::Packed);
-    let mk_out_layout = move || {
-        if out_channels == 1 {
-            ChannelLayout::MONO
-        } else {
-            ChannelLayout::STEREO
-        }
-    };
-
-    let mut swr = SwrCtx::get2(
-        in_format,
-        ChannelLayout::from(&in_ch_layout_raw),
-        in_sample_rate,
-        out_format,
-        mk_out_layout(),
-        out_sample_rate,
-    )
-    .map_err(|e| anyhow!("swresample init: {e}"))?;
 
     let mut in_frame = AudioFrame::empty();
 
@@ -537,14 +604,52 @@ fn audio_decode_loop(
             break;
         }
 
-        // Procesar seeks pendientes ANTES de leer paquete siguiente.
-        let mut seeked_to: Option<SeekMsg> = None;
-        while let Ok(msg) = seek_rx.try_recv() {
-            seeked_to = Some(msg);
+        // Procesar mensajes pendientes ANTES de leer paquete siguiente.
+        // Coalescencia: de una ráfaga solo importa el ÚLTIMO destino
+        // (target, pista) — pero un Switch intermedio SÍ cambia la
+        // pista aunque después llegue un Seek.
+        let mut land_at: Option<(f64, i32)> = None; // (target, serial)
+        let mut switch_to: Option<usize> = None;
+        while let Ok(msg) = msg_rx.try_recv() {
+            match msg {
+                AudioMsg::Seek { target_secs, serial } => {
+                    land_at = Some((target_secs, serial));
+                }
+                AudioMsg::Switch { stream_index, at_secs, serial } => {
+                    switch_to = Some(stream_index);
+                    land_at = Some((at_secs, serial));
+                }
+            }
         }
-        if let Some(msg) = seeked_to {
-            current_serial = msg.serial;
-            let target = msg.target_secs;
+        // Cambio de pista: reabrir decoder+resampler sobre el stream
+        // nuevo. Si falla (índice inválido, codec sin decoder…) se
+        // conserva la pista actual — el aterrizaje del land_at sigue
+        // siendo válido y el audio continúa sin cortarse.
+        if let Some(idx) = switch_to {
+            if idx != active_idx {
+                match open_track(&ictx, idx, out_channels, out_sample_rate) {
+                    Ok(new_ts) => {
+                        ts = new_ts;
+                        active_idx = idx;
+                        if let Some(log) = dec_log.as_mut() {
+                            use std::io::Write as _;
+                            let _ = writeln!(
+                                log,
+                                "{:.4} SWITCH stream={}",
+                                dec_origin.elapsed().as_secs_f64(),
+                                idx
+                            );
+                            let _ = log.flush();
+                        }
+                    }
+                    Err(e) => {
+                        eprintln_verbose(&format!("switch_track({idx}) falló: {e}"));
+                    }
+                }
+            }
+        }
+        if let Some((target, serial)) = land_at {
+            current_serial = serial;
             // Unidades: `Input::seek` → avformat_seek_file con
             // stream_index=-1 → timestamps en AV_TIME_BASE (µs).
             // OJO con el rango: `..ts` (exclusivo) produce
@@ -553,22 +658,22 @@ fn audio_decode_loop(
             // audio donde estaba (los hacia delante los enmascaraba el
             // trim). Con `..=ts` es (INT64_MIN, ts, ts) = keyframe<=ts,
             // exactamente como ffplay.
-            let ts = (target * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
-            let _ = ictx.seek(ts, ..=ts);
-            decoder.flush();
+            let seek_ts = (target * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
+            let _ = ictx.seek(seek_ts, ..=seek_ts);
+            ts.decoder.flush();
             // Recrear el resampler: su FIFO interno puede contener
             // samples pre-seek que saldrían etiquetados con el PTS
-            // nuevo (audio viejo sonándo tras el salto). Recrearlo es
+            // nuevo (audio viejo sonando tras el salto). Recrearlo es
             // barato y garantiza estado limpio.
             if let Ok(new_swr) = SwrCtx::get2(
-                in_format,
-                ChannelLayout::from(&in_ch_layout_raw),
-                in_sample_rate,
-                out_format,
-                mk_out_layout(),
+                ts.in_format,
+                ChannelLayout::from(&ts.in_ch_layout_raw),
+                ts.in_sample_rate,
+                SampleFormat::F32(SampleType::Packed),
+                mk_out_layout(out_channels),
                 out_sample_rate,
             ) {
-                swr = new_swr;
+                ts.swr = new_swr;
             }
             // Vaciar ring: aunque el callback descartaría por serial,
             // preferimos que llegue audio fresco cuanto antes.
@@ -596,58 +701,65 @@ fn audio_decode_loop(
 
         let pkt = match ictx.packets().next() {
             Some(Ok((s, p))) => {
-                if s.index() != audio_idx {
+                if s.index() != active_idx {
                     continue;
                 }
                 p
             }
             Some(Err(_)) => continue,
             None => {
-                let _ = decoder.send_eof();
+                let _ = ts.decoder.send_eof();
                 drain_audio(
-                    &mut decoder,
-                    &mut swr,
+                    &mut ts.decoder,
+                    &mut ts.swr,
                     &mut in_frame,
                     &samples_tx,
-                    &seek_rx,
+                    &msg_rx,
                     &stop,
                     current_serial,
                     out_channels,
                     out_sample_rate,
-                    in_sample_rate,
+                    ts.in_sample_rate,
                     &mut running_pts,
                     &mut trim_until_pts,
                 );
                 // Reset del decoder para poder reusarlo tras un seek
                 // hacia atrás (send_eof lo deja en estado draining).
-                decoder.flush();
+                ts.decoder.flush();
                 at_eof = true;
                 continue;
             }
         };
 
-        let _ = decoder.send_packet(&pkt);
+        let _ = ts.decoder.send_packet(&pkt);
 
-        while decoder.receive_frame(&mut in_frame).is_ok() {
+        while ts.decoder.receive_frame(&mut in_frame).is_ok() {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
             // PTS del frame decodificado (si es válido).
             let pkt_pts = in_frame.pts().unwrap_or(ffmpeg::sys::AV_NOPTS_VALUE);
             if pkt_pts != ffmpeg::sys::AV_NOPTS_VALUE {
-                running_pts = pkt_pts as f64 * tb_num / tb_den;
+                running_pts = pkt_pts as f64 * ts.tb_num / ts.tb_den;
             }
 
             // El PTS del primer sample de SALIDA de esta conversión:
             // el resampler puede tener buffer interno de la conversión
             // anterior, cuyo audio es ANTERIOR al frame actual.
-            let delay_in = swr
+            let delay_in = ts
+                .swr
                 .delay()
-                .map(|d| d.input as f64 / in_sample_rate as f64)
+                .map(|d| d.input as f64 / ts.in_sample_rate as f64)
                 .unwrap_or(0.0);
             let out_first_pts = running_pts - delay_in;
 
-            let samples = match resample_frame(&mut swr, &in_frame, out_channels, out_sample_rate, in_sample_rate) {
+            let samples = match resample_frame(
+                &mut ts.swr,
+                &in_frame,
+                out_channels,
+                out_sample_rate,
+                ts.in_sample_rate,
+            ) {
                 Some(s) => s,
                 None => continue,
             };
@@ -673,14 +785,14 @@ fn audio_decode_loop(
                         chunk.serial
                     );
                 }
-                if send_with_stop(&samples_tx, chunk, &stop, &seek_rx).is_err() {
+                if send_with_stop(&samples_tx, chunk, &stop, &msg_rx).is_err() {
                     return Ok(());
                 }
             }
             // Avanzar running_pts para el próximo frame por si viene
             // sin PTS (algunos codecs lo hacen). Se avanza por la
             // duración del frame de ENTRADA (timeline del media).
-            running_pts += in_frame.samples() as f64 / in_sample_rate as f64;
+            running_pts += in_frame.samples() as f64 / ts.in_sample_rate as f64;
         }
     }
     Ok(())
@@ -782,7 +894,7 @@ fn drain_audio(
     swr: &mut SwrCtx,
     in_frame: &mut AudioFrame,
     samples_tx: &Sender<AudioChunk>,
-    seek_rx: &Receiver<SeekMsg>,
+    msg_rx: &Receiver<AudioMsg>,
     stop: &Arc<AtomicBool>,
     current_serial: i32,
     out_channels: u16,
@@ -821,7 +933,7 @@ fn drain_audio(
             out_sample_rate,
             trim_until_pts,
         ) {
-            if send_with_stop(samples_tx, chunk, stop, seek_rx).is_err() {
+            if send_with_stop(samples_tx, chunk, stop, msg_rx).is_err() {
                 break;
             }
         }
@@ -847,15 +959,15 @@ fn extract_f32_interleaved(frame: &AudioFrame, channels: u16) -> Vec<f32> {
 }
 
 /// Envía un chunk respetando `stop`. Si mientras esperamos hueco en
-/// el ring llega un SEEK (seek_rx no vacío), descartamos el chunk y
-/// devolvemos Ok para que el loop principal procese el seek YA — sin
-/// esto, con el stream pausado (ring lleno, callback sin consumir) el
-/// hilo se quedaba bloqueado y los seeks en pausa no se aplicaban.
+/// el ring llega un mensaje (seek/switch, msg_rx no vacío), descartamos
+/// el chunk y devolvemos Ok para que el loop principal lo procese YA —
+/// sin esto, con el stream pausado (ring lleno, callback sin consumir)
+/// el hilo se quedaba bloqueado y los seeks en pausa no se aplicaban.
 fn send_with_stop(
     tx: &Sender<AudioChunk>,
     mut chunk: AudioChunk,
     stop: &Arc<AtomicBool>,
-    seek_rx: &Receiver<SeekMsg>,
+    msg_rx: &Receiver<AudioMsg>,
 ) -> std::result::Result<(), ()> {
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -864,8 +976,8 @@ fn send_with_stop(
         match tx.try_send(chunk) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Full(c)) => {
-                if !seek_rx.is_empty() {
-                    // Seek pendiente: este chunk ya es residuo.
+                if !msg_rx.is_empty() {
+                    // Seek/switch pendiente: este chunk ya es residuo.
                     return Ok(());
                 }
                 chunk = c;

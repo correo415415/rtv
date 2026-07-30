@@ -80,14 +80,16 @@ impl SubTrack {
     }
 }
 
-/// Carga la pista de subtítulos: externa si `sub_file` viene, si no
-/// la embebida "best" del contenedor (si existe). `None` si no hay
-/// nada que mostrar.
-pub fn load(media: &Path, sub_file: Option<&Path>) -> Option<SubTrack> {
-    if let Some(f) = sub_file {
-        return load_external(f).ok();
-    }
-    load_embedded(media)
+/// Carga una pista embebida CONCRETA por índice de stream del
+/// contenedor (para el ciclado en runtime `j`/`J` y `--sid/--slang`).
+pub fn load_embedded_track(media: &Path, stream_index: usize) -> Option<SubTrack> {
+    load_embedded(media, Some(stream_index))
+}
+
+/// Carga un fichero externo de subtítulos (público para el ciclado
+/// embebida↔externa del player).
+pub fn load_external_file(path: &Path) -> Option<SubTrack> {
+    load_external(path).ok()
 }
 
 // ------------------------- externos -------------------------
@@ -303,19 +305,22 @@ fn ass_payload_text(s: &str) -> String {
     strip_ass_tags(raw)
 }
 
-fn load_embedded(media: &Path) -> Option<SubTrack> {
+fn load_embedded(media: &Path, want_index: Option<usize>) -> Option<SubTrack> {
     // Sondeo rápido: ¿hay stream de subtítulos de TEXTO? (los bitmap
     // — dvdsub/pgs — no se pueden renderizar como texto; se ignoran).
     let ictx = ffmpeg::format::input(media).ok()?;
-    let stream = ictx.streams().best(Type::Subtitle)?;
+    let stream = match want_index {
+        Some(i) => {
+            let s = ictx.stream(i)?;
+            if s.parameters().medium() != Type::Subtitle {
+                return None;
+            }
+            s
+        }
+        None => ictx.streams().best(Type::Subtitle)?,
+    };
     let sidx = stream.index();
-    let codec_id = stream.parameters().id();
-    use ffmpeg::codec::Id;
-    let text_codec = matches!(
-        codec_id,
-        Id::SUBRIP | Id::SRT | Id::ASS | Id::SSA | Id::TEXT | Id::MOV_TEXT | Id::WEBVTT
-    );
-    if !text_codec {
+    if !crate::tracks::is_text_sub_codec(stream.parameters().id()) {
         return None;
     }
     let lang = stream

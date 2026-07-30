@@ -20,6 +20,7 @@ mod player;
 mod renderer;
 mod subs;
 mod terminfo;
+mod tracks;
 
 use anyhow::Result;
 use clap::Parser;
@@ -61,6 +62,25 @@ struct Cli {
     /// por defecto sin --sub; se mantiene por compatibilidad)
     #[arg(long)]
     no_subs: bool,
+
+    /// Pista de audio inicial por índice 1-based dentro de las pistas
+    /// de audio (`--aid 2` = segunda pista), como mpv.
+    #[arg(long, value_name = "N")]
+    aid: Option<usize>,
+
+    /// Pista de audio inicial por idioma ("eng", "spa", "en"...).
+    #[arg(long, value_name = "IDIOMA")]
+    alang: Option<String>,
+
+    /// Pista de subtítulos embebida inicial por índice 1-based dentro
+    /// de las pistas de texto del contenedor. Implica subtítulos ON.
+    #[arg(long, value_name = "N")]
+    sid: Option<usize>,
+
+    /// Pista de subtítulos embebida inicial por idioma. Implica
+    /// subtítulos ON.
+    #[arg(long, value_name = "IDIOMA")]
+    slang: Option<String>,
 
     /// Decode por hardware: auto | none | vaapi | cuda | qsv | d3d11va |
     /// dxva2 | videotoolbox | vulkan | drm | vdpau. `auto` prueba los
@@ -108,11 +128,19 @@ fn main() -> Result<()> {
     //   * `--sub` (vacío)    → pista embebida del contenedor
     //   * `--sub fichero`    → fichero externo .srt/.ass
     // `--no-subs` fuerza Off en cualquier caso (compatibilidad).
+    // `--sid/--slang` implican subtítulos embebidos ON aunque no se
+    // pase `--sub` (sería absurdo pedir una pista y no verla).
     let sub_mode = if cli.no_subs {
         player::SubMode::Off
     } else {
         match cli.sub.as_deref() {
-            None => player::SubMode::Off,
+            None => {
+                if cli.sid.is_some() || cli.slang.is_some() {
+                    player::SubMode::Embedded
+                } else {
+                    player::SubMode::Off
+                }
+            }
             Some("") => player::SubMode::Embedded,
             Some(p) => player::SubMode::File(PathBuf::from(p)),
         }
@@ -127,6 +155,10 @@ fn main() -> Result<()> {
         no_audio: cli.no_audio,
         hw_pref,
         sub_mode,
+        aid: cli.aid,
+        alang: cli.alang,
+        sid: cli.sid,
+        slang: cli.slang,
     })
 }
 

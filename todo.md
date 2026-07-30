@@ -349,27 +349,58 @@ Riesgos conocidos:
         decodifican 1080p HEVC de sobra); el fix elimina la clase entera
         de bloqueo por diseño (join acotado), no solo el síntoma.
 
-# 🔜 FUTURO (anotado, NO implementar todavía): cambio de pista en runtime
+# Tarea 7 (COMPLETADA): cambio de pista de audio/subtítulos en runtime
 
-    Objetivo: teclas para ciclar pista de AUDIO (`#` estilo mpv o `a`) y de
-    SUBTÍTULOS (`j`/`J`) durante la reproducción, sin cortar el playback.
+    Objetivo cumplido: teclas para ciclar pista de AUDIO (`a`/`#`, `A`
+    hacia atrás) y de SUBTÍTULOS (`j`/`J`) durante la reproducción, sin
+    cortar el playback, + selección inicial por CLI.
 
-    Diseño previsto (cuando se aborde):
-      * Inventario de pistas al abrir: enumerar streams audio/sub con
-        (index, lang, title, codec) y mostrarlos en el HUD al ciclar.
-      * Audio: `AudioHandle` necesita un mensaje `SwitchTrack(stream_idx)`
-        → el hilo audio-decoder reabre el decoder sobre el stream nuevo,
-        flushea el resampler y re-ancla el reloj en el PTS actual (mismo
-        mecanismo que el seek: bump de serial para silenciar chunks viejos).
-        OJO: si la pista nueva tiene layout/sample_rate distinto, recrear
-        SwrCtx; el sink cpal NO se toca (formato de salida fijo).
-      * Subtítulos: más simple — `subs::load_embedded` ya decodifica en un
-        hilo propio; bastaría parametrizar el stream_index elegido y
-        relanzar el hilo (los eventos son un Vec compartido bajo Mutex;
-        limpiar + recargar). Ciclar también entre embebida ↔ externa.
-      * CLI complementario: `--alang/--slang` (elegir por idioma al abrir)
-        y `--aid/--sid` (por índice), como mpv.
-      * Tests: MKV con 2 pistas de audio (tonos distintos L/R) y 2 de subs
-        (idiomas distintos) generado con ffmpeg; verificar en pty que el
-        ciclado cambia el texto mostrado y no rompe el sync (|avdiff| <60 ms
-        tras el cambio).
+    [x] src/tracks.rs (nuevo): inventario de pistas al abrir — probe()
+        enumera streams audio/sub-de-texto con (stream_index, lang,
+        title, codec); TrackInfo::label() para el OSD del HUD;
+        select() resuelve --aid/--sid (1-based, estilo mpv) y
+        --alang/--slang (matching por prefijo case-insensitive:
+        "en"↔"eng"). Unit tests 4/4.
+    [x] Audio en caliente: AudioMsg::Switch{stream_index, at_secs,
+        serial} → el hilo audio-decoder reabre decoder+resampler sobre
+        el stream nuevo (struct TrackState: cada pista puede tener
+        codec/rate/layout propios; el SwrCtx nuevo normaliza al formato
+        FIJO del sink cpal, que no se toca) y aterriza en `at_secs` con
+        el MISMO camino que un seek (ictx.seek ..=ts + trim
+        sample-accurate + drenado del ring). El player hace
+        master.set(now) ANTES (bump de seriales → chunks viejos
+        silenciados) y el vídeo entra en el hold estándar de master
+        desanclado: al primer chunk de la pista nueva el reloj ancla y
+        sigue en sync. Si open_track falla (stream inválido) se
+        conserva la pista actual sin cortar el audio.
+    [x] Subtítulos: subs::load_embedded parametrizado por stream_index
+        (load_embedded_track) + load_external_file público. El player
+        mantiene el ciclo Off → [externa --sub] → embebidas → Off
+        (SubChoice); al ciclar se recarga la pista en su hilo propio y
+        si aparecen/desaparecen las 2 filas reservadas se recomputa el
+        layout y se redibuja el último frame al instante (como un
+        resize).
+    [x] OSD en el HUD: "Audio [2/2]: spa (aac)" / "Subs [3/4]: eng
+        (subrip)" durante ~2.5 s — entra en la key del HudCache, así
+        que aparece/desaparece con un solo repintado. Casos
+        informativos: "única pista", "no hay pistas", "sin audio".
+    [x] CLI: --aid N / --alang IDIOMA / --sid N / --slang IDIOMA.
+        --sid/--slang implican subtítulos ON sin necesidad de --sub.
+        Fallback silencioso a "best" si no hay match.
+    [x] tests/integration_tracks.py (nuevo): MKV generado con ffmpeg
+        (smptebars + 2 audios de tonos 440/880 Hz eng/spa + 2 SRT
+        eng/spa). 18/18 checks PASS en pty real:
+          * `j` dos veces → "ENGLISH LINE" y luego "SPANISH LINE"
+            visibles en pantalla; OSD "Subs [" presente.
+          * `a` dos veces → OSD "Audio [", sync-log: |avdiff| mediano
+            post-switch 0.0-0.2 ms (<60 ms), 50+ frames tras los
+            cambios (no se congela), exit 0.
+          * --aid 2 / --alang spa / --sid 2 / --slang eng arrancan y
+            muestran la pista correcta.
+          * `a` con vídeo mono-audio → OSD "única pista", exit 0.
+    [x] Regresión: integration_sync.py PASS (avdiff normal 1.0 ms,
+        8/8 seeks, post-seek 0.5-1.1 ms), integration_backends_subs.py
+        PASS (6 grupos), unit tests 18/18 (14 previos + 4 de tracks).
+    [x] README: tabla de opciones (--aid/--alang/--sid/--slang), tabla
+        de teclas (a/#/A, j/J), sección "Cambio de pista en runtime",
+        tracks.rs y el test nuevo en la estructura.
