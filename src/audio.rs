@@ -108,10 +108,30 @@ impl AudioHandle {
         }
     }
 
+    /// Parada cooperativa con join ACOTADO (500 ms), espejo del fix de
+    /// `DecoderHandle::stop`. El hilo audio-decoder puede estar:
+    ///   * dormido en el backoff de `send_with_stop` (sale al ver el
+    ///     flag en <4 ms), o
+    ///   * bloqueado dentro de FFmpeg (send_packet/receive_frame) o de
+    ///     un canal lleno cuyo consumidor (callback cpal) ya no drena
+    ///     porque el stream fue pausado/parado — irrecuperable por
+    ///     flag. En ese caso se le suelta (detach): el proceso está
+    ///     saliendo y el SO recoge el hilo. Nunca colgamos la salida.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(j) = self.decoder_join.take() {
-            let _ = j.join();
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            loop {
+                if j.is_finished() {
+                    let _ = j.join();
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    drop(j); // detach de último recurso
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 }

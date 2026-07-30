@@ -74,6 +74,27 @@ pub fn detect_backend(forced: Option<&str>) -> Backend {
     if kitty {
         return Backend::Kitty;
     }
+    // iTerm2: TERM_PROGRAM=iTerm.app en local; LC_TERMINAL=iTerm2 se
+    // propaga por ssh (iTerm2 lo exporta y sshd suele aceptar LC_*).
+    let lc_terminal = std::env::var("LC_TERMINAL").unwrap_or_default();
+    if term_program.eq_ignore_ascii_case("iTerm.app")
+        || lc_terminal.eq_ignore_ascii_case("iTerm2")
+    {
+        return Backend::Iterm2;
+    }
+    // Sixel: terminales que lo soportan de serie. xterm solo lo activa
+    // compilado con --enable-sixel-graphics Y lanzado con -ti vt340 →
+    // en ese caso TERM suele ser "xterm-sixel" (o el usuario fuerza
+    // --backend sixel). mlterm/foot/contour lo traen siempre.
+    if term.contains("sixel")
+        || term.starts_with("mlterm")
+        || std::env::var("MLTERM").is_ok()
+        || term == "foot" || term == "foot-extra"
+        || term.starts_with("contour")
+        || term_program.eq_ignore_ascii_case("contour")
+    {
+        return Backend::Sixel;
+    }
     Backend::HalfBlocks
 }
 
@@ -129,8 +150,18 @@ pub struct Renderer {
     /// recorte a los límites de la terminal.
     cell_px_w: u32,
     cell_px_h: u32,
-    /// Buffer de recorte para Kitty (crop del RGB antes del base64).
+    /// Buffer de recorte para Kitty/iTerm2 (crop del RGB antes del base64).
     crop_buf: Vec<u8>,
+    /// Sixel: buffer de índices de paleta (1 byte/px) del frame ya
+    /// cuantizado + ditheado.
+    sixel_idx: Vec<u8>,
+    /// Sixel: máscaras de bits por color de la banda en curso
+    /// (layout [color][columna]) para el pase por color.
+    sixel_band: Vec<u8>,
+    /// Sixel: definición de la paleta fija (se construye una vez).
+    sixel_palette: String,
+    /// iTerm2: buffer del fichero BMP construido en memoria.
+    file_buf: Vec<u8>,
 }
 
 impl Renderer {
@@ -143,6 +174,10 @@ impl Renderer {
             cell_px_w: 8,
             cell_px_h: 16,
             crop_buf: Vec::new(),
+            sixel_idx: Vec::new(),
+            sixel_band: Vec::new(),
+            sixel_palette: build_sixel_palette(),
+            file_buf: Vec::new(),
         }
     }
 
@@ -202,7 +237,9 @@ impl Renderer {
 
         match self.backend {
             Backend::Kitty => self.draw_kitty(out, frame, max_cols, max_rows, col_ox, row_oy)?,
-            Backend::HalfBlocks | Backend::Iterm2 | Backend::Sixel => {
+            Backend::Iterm2 => self.draw_iterm2(out, frame, max_cols, max_rows, col_ox, row_oy)?,
+            Backend::Sixel => self.draw_sixel(out, frame, max_cols, max_rows, col_ox, row_oy)?,
+            Backend::HalfBlocks => {
                 self.draw_halfblocks(out, frame, max_cols, max_rows, col_ox, row_oy)?
             }
             Backend::Ascii => self.draw_ascii(out, frame, max_cols, max_rows, col_ox, row_oy)?,
@@ -344,6 +381,231 @@ impl Renderer {
         Ok(())
     }
 
+    /// iTerm2 — protocolo de imágenes inline (OSC 1337 File=).
+    ///
+    /// Construimos un BMP de 24 bits SIN compresión en memoria (cero
+    /// dependencias, coste ~memcpy) y lo mandamos en base64. iTerm2 lo
+    /// decodifica con NSImage (BMP soportado nativamente). `width`/
+    /// `height` van en CELDAS para que el mapeo a la rejilla del
+    /// terminal sea exacto e independiente del factor Retina (los
+    /// valores en px del protocolo son "puntos", no píxeles: en
+    /// pantallas 2x la imagen saldría al doble de tamaño).
+    fn draw_iterm2<W: Write>(
+        &mut self,
+        out: &mut W,
+        frame: &RgbFrame,
+        max_cols: u16,
+        max_rows: u16,
+        col_ox: u16,
+        row_oy: u16,
+    ) -> Result<()> {
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let stride = w * 3;
+        if frame.data.len() < h * stride {
+            return Ok(());
+        }
+
+        // Recorte en píxeles al área útil (mismo criterio que Kitty).
+        let avail_px_w = (max_cols - col_ox) as usize * self.cell_px_w as usize;
+        let avail_px_h = (max_rows - row_oy) as usize * self.cell_px_h as usize;
+        let vis_w = w.min(avail_px_w).max(1);
+        let vis_h = h.min(avail_px_h).max(1);
+
+        // BMP 24bpp: cabecera 14 + DIB 40, filas BGR bottom-up con
+        // padding a múltiplo de 4 bytes.
+        let row_bytes = (vis_w * 3 + 3) & !3;
+        let img_size = row_bytes * vis_h;
+        let file_size = 54 + img_size;
+        self.file_buf.clear();
+        self.file_buf.reserve(file_size);
+        let fb = &mut self.file_buf;
+        fb.extend_from_slice(b"BM");
+        fb.extend_from_slice(&(file_size as u32).to_le_bytes());
+        fb.extend_from_slice(&0u32.to_le_bytes()); // reservado
+        fb.extend_from_slice(&54u32.to_le_bytes()); // offset de píxeles
+        fb.extend_from_slice(&40u32.to_le_bytes()); // tamaño DIB
+        fb.extend_from_slice(&(vis_w as i32).to_le_bytes());
+        fb.extend_from_slice(&(vis_h as i32).to_le_bytes());
+        fb.extend_from_slice(&1u16.to_le_bytes()); // planos
+        fb.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        fb.extend_from_slice(&0u32.to_le_bytes()); // sin compresión
+        fb.extend_from_slice(&(img_size as u32).to_le_bytes());
+        fb.extend_from_slice(&2835i32.to_le_bytes()); // 72 dpi
+        fb.extend_from_slice(&2835i32.to_le_bytes());
+        fb.extend_from_slice(&0u32.to_le_bytes());
+        fb.extend_from_slice(&0u32.to_le_bytes());
+        for y in (0..vis_h).rev() {
+            let row = &frame.data[y * stride..y * stride + vis_w * 3];
+            for px in row.chunks_exact(3) {
+                fb.extend_from_slice(&[px[2], px[1], px[0]]); // RGB→BGR
+            }
+            for _ in vis_w * 3..row_bytes {
+                fb.push(0);
+            }
+        }
+
+        self.b64.clear();
+        B64.encode_string(&self.file_buf, &mut self.b64);
+
+        let cells_w = vis_w.div_ceil(self.cell_px_w.max(1) as usize);
+        let cells_h = vis_h.div_ceil(self.cell_px_h.max(1) as usize);
+
+        self.scratch.clear();
+        write!(
+            &mut self.scratch,
+            "\x1b[{};{}H\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=0:",
+            row_oy as usize + 1,
+            col_ox as usize + 1,
+            file_size,
+            cells_w,
+            cells_h,
+        )?;
+        self.scratch.extend_from_slice(self.b64.as_bytes());
+        self.scratch.push(0x07); // BEL — terminador OSC
+        out.write_all(&self.scratch)?;
+        Ok(())
+    }
+
+    /// Sixel — encoder real (DCS `ESC P q … ESC \`).
+    ///
+    /// Estrategia:
+    ///   * Paleta FIJA de 252 registros (cubo RGB 6×7×6, más niveles
+    ///     en verde: el ojo es más sensible). Se re-emite en CADA
+    ///     frame: xterm usa registros de color PRIVADOS por imagen
+    ///     (privateColorRegisters, default on) y sin la paleta cada
+    ///     frame saldría en negro.
+    ///   * Dithering ORDENADO (Bayer 4×4): sin dependencias seriales
+    ///     entre píxeles (a diferencia de Floyd-Steinberg) → barato y
+    ///     estable entre frames (el ruido no "hierve").
+    ///   * Codificación por bandas de 6 filas: una pasada rellena
+    ///     máscaras por color (`sixel_band`, [color][columna]) y cada
+    ///     color presente se emite con RLE (`!n`), `$` (CR) entre
+    ///     colores y `-` (LF) entre bandas.
+    fn draw_sixel<W: Write>(
+        &mut self,
+        out: &mut W,
+        frame: &RgbFrame,
+        max_cols: u16,
+        max_rows: u16,
+        col_ox: u16,
+        row_oy: u16,
+    ) -> Result<()> {
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let stride = w * 3;
+        if frame.data.len() < h * stride {
+            return Ok(());
+        }
+
+        let avail_px_w = (max_cols - col_ox) as usize * self.cell_px_w as usize;
+        let avail_px_h = (max_rows - row_oy) as usize * self.cell_px_h as usize;
+        let vis_w = w.min(avail_px_w).max(1);
+        let vis_h = h.min(avail_px_h).max(1);
+
+        // --- 1) Cuantización + dithering a índices de paleta ---
+        const BAYER4: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+        #[inline(always)]
+        fn quant(v: u8, levels: u32, t: u32) -> u32 {
+            ((v as u32 * (levels - 1) * 16 + t * 255) / (255 * 16)).min(levels - 1)
+        }
+        self.sixel_idx.resize(vis_w * vis_h, 0);
+        for y in 0..vis_h {
+            let row = &frame.data[y * stride..y * stride + vis_w * 3];
+            let dst = &mut self.sixel_idx[y * vis_w..(y + 1) * vis_w];
+            let by = (y & 3) * 4;
+            for x in 0..vis_w {
+                let t = BAYER4[by + (x & 3)] as u32;
+                let i = x * 3;
+                let r = quant(row[i], 6, t);
+                let g = quant(row[i + 1], 7, t);
+                let b = quant(row[i + 2], 6, t);
+                dst[x] = (r * 42 + g * 6 + b) as u8;
+            }
+        }
+
+        // --- 2) Emisión ---
+        self.scratch.clear();
+        write!(
+            &mut self.scratch,
+            "\x1b[{};{}H",
+            row_oy as usize + 1,
+            col_ox as usize + 1
+        )?;
+        // DCS: P1=0 (aspect 1:1), P2=1 (bits a 0 → transparentes, no
+        // pintan fondo fuera del letterbox), P3=0. Atributos raster
+        // "Pan;Pad;Ph;Pv" ayudan al terminal a reservar el área.
+        write!(&mut self.scratch, "\x1bP0;1;0q\"1;1;{};{}", vis_w, vis_h)?;
+        self.scratch.extend_from_slice(self.sixel_palette.as_bytes());
+
+        // Máscaras por color de la banda: [color][columna] → bits 0-5.
+        self.sixel_band.resize(256 * vis_w, 0);
+        let mut used: Vec<u16> = Vec::with_capacity(64);
+        let mut present = [false; 256];
+
+        let bands = vis_h.div_ceil(6);
+        for band in 0..bands {
+            let y0 = band * 6;
+            let rows_in = (vis_h - y0).min(6);
+
+            used.clear();
+            present.fill(false);
+            for j in 0..rows_in {
+                let src = &self.sixel_idx[(y0 + j) * vis_w..(y0 + j + 1) * vis_w];
+                let bit = 1u8 << j;
+                for (x, &c) in src.iter().enumerate() {
+                    let c = c as usize;
+                    if !present[c] {
+                        present[c] = true;
+                        used.push(c as u16);
+                    }
+                    self.sixel_band[c * vis_w + x] |= bit;
+                }
+            }
+
+            for (k, &c) in used.iter().enumerate() {
+                write!(&mut self.scratch, "#{}", c)?;
+                let rowm = &self.sixel_band[c as usize * vis_w..c as usize * vis_w + vis_w];
+                // Recortar ceros finales: '?' (vacío) al final no aporta.
+                let mut end = vis_w;
+                while end > 0 && rowm[end - 1] == 0 {
+                    end -= 1;
+                }
+                let mut x = 0;
+                while x < end {
+                    let v = rowm[x];
+                    let mut run = 1;
+                    while x + run < end && rowm[x + run] == v {
+                        run += 1;
+                    }
+                    let ch = 63 + v;
+                    if run >= 4 {
+                        write!(&mut self.scratch, "!{}", run)?;
+                        self.scratch.push(ch);
+                    } else {
+                        for _ in 0..run {
+                            self.scratch.push(ch);
+                        }
+                    }
+                    x += run;
+                }
+                if k + 1 < used.len() {
+                    self.scratch.push(b'$'); // CR: siguiente color, misma banda
+                } else if band + 1 < bands {
+                    self.scratch.push(b'-'); // LF: siguiente banda
+                }
+            }
+
+            // Limpiar solo las filas de colores usados (no las 256).
+            for &c in &used {
+                self.sixel_band[c as usize * vis_w..c as usize * vis_w + vis_w].fill(0);
+            }
+        }
+        self.scratch.extend_from_slice(b"\x1b\\"); // ST — fin DCS
+        out.write_all(&self.scratch)?;
+        Ok(())
+    }
+
     fn draw_ascii<W: Write>(
         &mut self,
         out: &mut W,
@@ -408,6 +670,28 @@ impl Renderer {
 ///     terminales lentas. El padding hasta `cols` ya cubre la fila
 ///     entera, así que la escritura es idéntica visualmente pero
 ///     atómica (sin estado intermedio en blanco).
+/// Paleta fija sixel: cubo RGB 6×7×6 (252 registros). El eje verde
+/// lleva 7 niveles (sensibilidad del ojo). Los valores van en escala
+/// 0..100 como exige el protocolo (`#n;2;r;g;b`). Se construye una
+/// vez y se re-emite en cada frame (los registros de color de xterm
+/// son privados por imagen con la config por defecto).
+fn build_sixel_palette() -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(252 * 16);
+    for r in 0..6u32 {
+        for g in 0..7u32 {
+            for b in 0..6u32 {
+                let idx = r * 42 + g * 6 + b;
+                let rr = r * 100 / 5;
+                let gg = g * 100 / 6;
+                let bb = b * 100 / 5;
+                let _ = write!(s, "#{};2;{};{};{}", idx, rr, gg, bb);
+            }
+        }
+    }
+    s
+}
+
 pub fn draw_hud_at(out: &mut StdoutLock, cols: u16, row: u16, line: &str) -> Result<()> {
     let (content, content_width) = truncate_to_width(line, cols as usize);
     let pad_needed = (cols as usize).saturating_sub(content_width);

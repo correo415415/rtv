@@ -35,6 +35,7 @@ use crate::clock::{
 use crate::decoder;
 use crate::input::{self, Cmd};
 use crate::renderer::{self, Renderer};
+use crate::subs;
 use crate::terminfo::{self, CellPx};
 
 pub struct Config {
@@ -45,6 +46,11 @@ pub struct Config {
     pub show_stats: bool,
     pub no_audio: bool,
     pub hw_pref: crate::hwdec::HwPref,
+    /// Subtítulos: fichero externo (.srt/.ass). Si es None se intenta
+    /// la pista embebida "best" del contenedor.
+    pub sub_file: Option<PathBuf>,
+    /// Desactivar subtítulos por completo.
+    pub no_subs: bool,
 }
 
 struct TerminalGuard {
@@ -143,10 +149,37 @@ pub fn run(cfg: Config) -> Result<()> {
         a.set_volume(volume);
     }
 
+    // Subtítulos softsub (externos --sub o embebidos). La carga de
+    // los embebidos corre en un hilo propio (demux solo-subs); aquí
+    // solo se decide si hay pista → se reservan 2 filas encima del
+    // HUD para el texto (fijas toda la sesión: sin saltos de layout).
+    let sub_track: Option<subs::SubTrack> = if cfg.no_subs {
+        None
+    } else {
+        subs::load(&cfg.path, cfg.sub_file.as_deref())
+    };
+    let sub_rows_for = |rows: u16, has: bool| -> u16 {
+        if has && rows >= 8 {
+            2
+        } else {
+            0
+        }
+    };
+    let mut sub_rows = sub_rows_for(rows, sub_track.is_some());
+    // Caché del último texto de subtítulo pintado (anti-parpadeo,
+    // misma filosofía que HudCache).
+    let mut sub_cache: Option<(u16, u16, String)> = None;
+
     // Decoder vídeo.
     let mut hud_lines = hud_rows_for(cols, rows);
-    let (dst_w0, dst_h0) =
-        terminfo::adaptive_target_pixels(backend, cols, rows, cell_px, cfg.scale, hud_lines);
+    let (dst_w0, dst_h0) = terminfo::adaptive_target_pixels(
+        backend,
+        cols,
+        rows,
+        cell_px,
+        cfg.scale,
+        hud_lines + sub_rows,
+    );
     let dec = decoder::spawn(&cfg.path, dst_w0, dst_h0, cfg.hw_pref)?;
 
     // Etiqueta del HUD: "kitty" (sw) o "kitty+vaapi" (decode HW).
@@ -166,7 +199,7 @@ pub fn run(cfg: Config) -> Result<()> {
         rows,
         cell_px,
         cfg.scale,
-        hud_lines,
+        hud_lines + sub_rows,
     );
     dec.resize(dst_w, dst_h);
 
@@ -370,6 +403,7 @@ pub fn run(cfg: Config) -> Result<()> {
                     cols = c.max(4);
                     rows = r.max(3);
                     hud_lines = hud_rows_for(cols, rows);
+                    sub_rows = sub_rows_for(rows, sub_track.is_some());
                     let (nw, nh, _, _) = compute_layout(
                         backend,
                         dec.source_size,
@@ -377,7 +411,7 @@ pub fn run(cfg: Config) -> Result<()> {
                         rows,
                         cell_px,
                         cfg.scale,
-                        hud_lines,
+                        hud_lines + sub_rows,
                     );
                     // ¿Creció el área de vídeo? → programar refinado
                     // (debounce 300 ms: en un arrastre solo se refina
@@ -393,12 +427,12 @@ pub fn run(cfg: Config) -> Result<()> {
                     dst_w = nw;
                     dst_h = nh;
                     dec.resize(dst_w, dst_h);
-                    hud_cache = None;
+                    hud_cache = None; sub_cache = None;
                     renderer_.reset_layout_cache();
                     force_full_redraw = true;
                     if let Some(f) = last_frame.as_mut() {
                         rescale_frame_nearest(f, dst_w, dst_h);
-                        let vid_rows = rows.saturating_sub(hud_lines).max(1);
+                        let vid_rows = rows.saturating_sub(hud_lines + sub_rows).max(1);
                         let (ox, oy) =
                             offsets_for_frame(backend, cell_px, f.width, f.height, cols, vid_rows);
                         let mut sol = so.lock();
@@ -471,7 +505,7 @@ pub fn run(cfg: Config) -> Result<()> {
                             }
                             pending_audio_landing = false;
                         }
-                        let vid_rows = rows.saturating_sub(hud_lines).max(1);
+                        let vid_rows = rows.saturating_sub(hud_lines + sub_rows).max(1);
                         let (ox, oy) = offsets_for_frame(
                             backend, cell_px, frame.width, frame.height, cols, vid_rows,
                         );
@@ -479,11 +513,11 @@ pub fn run(cfg: Config) -> Result<()> {
                         if force_full_redraw {
                             let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                             force_full_redraw = false;
-                            hud_cache = None;
+                            hud_cache = None; sub_cache = None;
                             renderer_.reset_layout_cache();
                         }
                         if matches!(renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy), Ok(true)) {
-                            hud_cache = None;
+                            hud_cache = None; sub_cache = None;
                         }
                         drop(sol);
                         last_shown_pts = frame.pts;
@@ -515,6 +549,16 @@ pub fn run(cfg: Config) -> Result<()> {
                 // 20 ms que retrasaba la respuesta en pausa).
                 input::wait_event(Duration::from_millis(50));
             }
+            draw_subs_dispatch(
+                &mut so,
+                cols,
+                rows,
+                hud_lines,
+                sub_rows,
+                sub_track.as_ref(),
+                last_shown_pts,
+                &mut sub_cache,
+            );
             draw_hud_dispatch(
                 &mut so,
                 cols,
@@ -626,18 +670,18 @@ pub fn run(cfg: Config) -> Result<()> {
                 pending_audio_landing = false;
             }
             {
-                let vid_rows = rows.saturating_sub(hud_lines).max(1);
+                let vid_rows = rows.saturating_sub(hud_lines + sub_rows).max(1);
                 let (ox, oy) =
                     offsets_for_frame(backend, cell_px, frame.width, frame.height, cols, vid_rows);
                 let mut sol = so.lock();
                 if force_full_redraw {
                     let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                     force_full_redraw = false;
-                    hud_cache = None;
+                    hud_cache = None; sub_cache = None;
                     renderer_.reset_layout_cache();
                 }
                 if matches!(renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy), Ok(true)) {
-                    hud_cache = None;
+                    hud_cache = None; sub_cache = None;
                 }
             }
             vidclk.set_pts(frame.pts, vidclk.current_serial());
@@ -660,6 +704,16 @@ pub fn run(cfg: Config) -> Result<()> {
                 );
                 let _ = log.flush();
             }
+            draw_subs_dispatch(
+                &mut so,
+                cols,
+                rows,
+                hud_lines,
+                sub_rows,
+                sub_track.as_ref(),
+                frame.pts,
+                &mut sub_cache,
+            );
             draw_hud_dispatch(
                 &mut so,
                 cols,
@@ -773,18 +827,18 @@ pub fn run(cfg: Config) -> Result<()> {
         //    y nuevas, y cada uno se centra/recorta correctamente sin
         //    perder el colchón de pre-decode ni tocar el sync.
         {
-            let vid_rows = rows.saturating_sub(hud_lines).max(1);
+            let vid_rows = rows.saturating_sub(hud_lines + sub_rows).max(1);
             let (ox, oy) =
                 offsets_for_frame(backend, cell_px, frame.width, frame.height, cols, vid_rows);
             let mut sol = so.lock();
             if force_full_redraw {
                 let _ = write!(&mut sol, "\x1b[2J\x1b[H");
                 force_full_redraw = false;
-                hud_cache = None;
+                hud_cache = None; sub_cache = None;
                 renderer_.reset_layout_cache();
             }
             if matches!(renderer_.draw(&mut sol, &frame, cols, vid_rows, ox, oy), Ok(true)) {
-                hud_cache = None;
+                hud_cache = None; sub_cache = None;
             }
         }
 
@@ -814,6 +868,16 @@ pub fn run(cfg: Config) -> Result<()> {
             let _ = log.flush();
         }
 
+        draw_subs_dispatch(
+            &mut so,
+            cols,
+            rows,
+            hud_lines,
+            sub_rows,
+            sub_track.as_ref(),
+            frame.pts,
+            &mut sub_cache,
+        );
         draw_hud_dispatch(
             &mut so,
             cols,
@@ -922,6 +986,56 @@ fn px_to_cells(
 ) -> (u16, u16) {
     let (pcx, pcy) = px_per_cell(backend, cell);
     ((px_x / pcx.max(1)) as u16, (px_y / pcy.max(1)) as u16)
+}
+
+/// Pinta las filas de subtítulos (encima del HUD). Cacheado por
+/// contenido: solo reescribe cuando el texto cambia (los eventos
+/// duran segundos → ~0 coste por refresco). El texto se centra y se
+/// recorta al ancho; si tiene más líneas que filas reservadas se
+/// muestran las ÚLTIMAS (las más recientes del diálogo).
+fn draw_subs_dispatch(
+    so: &mut Stdout,
+    cols: u16,
+    rows: u16,
+    hud_lines: u16,
+    sub_rows: u16,
+    track: Option<&subs::SubTrack>,
+    t: f64,
+    cache: &mut Option<(u16, u16, String)>,
+) {
+    if sub_rows == 0 {
+        return;
+    }
+    let Some(track) = track else { return };
+    let text = track.query(t).unwrap_or_default();
+    let key = (cols, rows, text);
+    if cache.as_ref() == Some(&key) {
+        return;
+    }
+    let first_row = rows.saturating_sub(hud_lines + sub_rows) + 1;
+    let lines: Vec<&str> = key.2.lines().collect();
+    let start = lines.len().saturating_sub(sub_rows as usize);
+    let mut sol = so.lock();
+    for i in 0..sub_rows {
+        let content = lines.get(start + i as usize).copied().unwrap_or("");
+        let centered = center_text(content, cols);
+        let _ = renderer::draw_hud_at(&mut sol, cols, first_row + i, &centered);
+    }
+    let _ = sol.flush();
+    *cache = Some(key);
+}
+
+/// Centra `s` en `cols` celdas (por anchura unicode real).
+fn center_text(s: &str, cols: u16) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let w = s.width();
+    let pad = (cols as usize).saturating_sub(w) / 2;
+    let mut out = String::with_capacity(pad + s.len());
+    for _ in 0..pad {
+        out.push(' ');
+    }
+    out.push_str(s);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
