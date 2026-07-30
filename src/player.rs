@@ -263,8 +263,8 @@ pub fn run(cfg: Config) -> Result<()> {
     };
     let mut sub_rows = sub_rows_for(rows, sub_track.is_some());
     // Caché del último texto de subtítulo pintado (anti-parpadeo,
-    // misma filosofía que HudCache).
-    let mut sub_cache: Option<(u16, u16, String)> = None;
+    // misma filosofía que HudCache): (cols, rows, fila_inicial, texto).
+    let mut sub_cache: Option<(u16, u16, u16, String)> = None;
 
     // OSD transitorio del HUD (feedback al ciclar pistas): texto +
     // instante de creación; se muestra ~2.5 s en la línea 1 del HUD
@@ -591,7 +591,11 @@ pub fn run(cfg: Config) -> Result<()> {
                                     backend, cell_px, f.width, f.height, cols, vid_rows,
                                 );
                                 let mut sol = so.lock();
-                                let _ = write!(&mut sol, "\x1b[2J\x1b[H");
+                                // Sin 2J manual: reset_layout_cache ya
+                                // fuerza el clear DENTRO del batch
+                                // sincronizado (?2026) del renderer;
+                                // el clear manual fuera del batch era
+                                // el parpadeo visible al pulsar `j`.
                                 let _ = renderer_.draw(&mut sol, f, cols, vid_rows, ox, oy);
                                 let _ = sol.flush();
                                 force_full_redraw = false;
@@ -731,7 +735,8 @@ pub fn run(cfg: Config) -> Result<()> {
                         );
                         let mut sol = so.lock();
                         if force_full_redraw {
-                            let _ = write!(&mut sol, "\x1b[2J\x1b[H");
+                            // Clear dentro del batch ?2026 del renderer
+                            // (vía reset_layout_cache) — sin flash.
                             force_full_redraw = false;
                             hud_cache = None; sub_cache = None;
                             renderer_.reset_layout_cache();
@@ -769,12 +774,17 @@ pub fn run(cfg: Config) -> Result<()> {
                 // 20 ms que retrasaba la respuesta en pausa).
                 input::wait_event(Duration::from_millis(50));
             }
+            let vb = last_frame.as_ref().map(|f| {
+                let vid_rows = rows.saturating_sub(hud_lines + sub_rows).max(1);
+                video_bottom_row(backend, cell_px, f.width, f.height, cols, vid_rows)
+            });
             draw_subs_dispatch(
                 &mut so,
                 cols,
                 rows,
                 hud_lines,
                 sub_rows,
+                vb,
                 sub_track.as_ref(),
                 last_shown_pts,
                 &mut sub_cache,
@@ -896,7 +906,9 @@ pub fn run(cfg: Config) -> Result<()> {
                     offsets_for_frame(backend, cell_px, frame.width, frame.height, cols, vid_rows);
                 let mut sol = so.lock();
                 if force_full_redraw {
-                    let _ = write!(&mut sol, "\x1b[2J\x1b[H");
+                    // Sin 2J manual fuera del batch: reset_layout_cache
+                    // hace que el renderer emita el clear DENTRO del
+                    // batch sincronizado (?2026) → sin flash negro.
                     force_full_redraw = false;
                     hud_cache = None; sub_cache = None;
                     renderer_.reset_layout_cache();
@@ -925,12 +937,17 @@ pub fn run(cfg: Config) -> Result<()> {
                 );
                 let _ = log.flush();
             }
+            let vb = {
+                let vid_rows = rows.saturating_sub(hud_lines + sub_rows).max(1);
+                video_bottom_row(backend, cell_px, frame.width, frame.height, cols, vid_rows)
+            };
             draw_subs_dispatch(
                 &mut so,
                 cols,
                 rows,
                 hud_lines,
                 sub_rows,
+                Some(vb),
                 sub_track.as_ref(),
                 frame.pts,
                 &mut sub_cache,
@@ -1054,7 +1071,8 @@ pub fn run(cfg: Config) -> Result<()> {
                 offsets_for_frame(backend, cell_px, frame.width, frame.height, cols, vid_rows);
             let mut sol = so.lock();
             if force_full_redraw {
-                let _ = write!(&mut sol, "\x1b[2J\x1b[H");
+                // Clear dentro del batch ?2026 del renderer
+                // (vía reset_layout_cache) — sin flash.
                 force_full_redraw = false;
                 hud_cache = None; sub_cache = None;
                 renderer_.reset_layout_cache();
@@ -1090,12 +1108,17 @@ pub fn run(cfg: Config) -> Result<()> {
             let _ = log.flush();
         }
 
+        let vb = {
+            let vid_rows = rows.saturating_sub(hud_lines + sub_rows).max(1);
+            video_bottom_row(backend, cell_px, frame.width, frame.height, cols, vid_rows)
+        };
         draw_subs_dispatch(
             &mut so,
             cols,
             rows,
             hud_lines,
             sub_rows,
+            Some(vb),
             sub_track.as_ref(),
             frame.pts,
             &mut sub_cache,
@@ -1211,38 +1234,80 @@ fn px_to_cells(
     ((px_x / pcx.max(1)) as u16, (px_y / pcy.max(1)) as u16)
 }
 
-/// Pinta las filas de subtítulos (encima del HUD). Cacheado por
-/// contenido: solo reescribe cuando el texto cambia (los eventos
-/// duran segundos → ~0 coste por refresco). El texto se centra y se
+/// Fila 1-based de la ÚLTIMA fila de celdas ocupada por el vídeo
+/// (offset de centrado vertical + alto del frame en celdas), dentro
+/// del área de vídeo `vid_rows`. Sirve para anclar los subtítulos
+/// justo debajo de la imagen en vez de al fondo de la terminal.
+fn video_bottom_row(
+    backend: renderer::Backend,
+    cell: CellPx,
+    fw: u32,
+    fh: u32,
+    cols: u16,
+    vid_rows: u16,
+) -> u16 {
+    let (_, pcy) = px_per_cell(backend, cell);
+    let ch = fh.div_ceil(pcy.max(1)).max(1).min(u32::from(vid_rows)) as u16;
+    let (_, oy) = offsets_for_frame(backend, cell, fw, fh, cols, vid_rows);
+    (oy + ch).min(vid_rows)
+}
+
+/// Pinta las filas de subtítulos. Cacheado por contenido: solo
+/// reescribe cuando el texto (o su posición) cambia — los eventos
+/// duran segundos → ~0 coste por refresco. El texto se centra y se
 /// recorta al ancho; si tiene más líneas que filas reservadas se
 /// muestran las ÚLTIMAS (las más recientes del diálogo).
+///
+/// Colocación: si el vídeo va letterboxeado (barra negra inferior
+/// dentro del área de vídeo), los subtítulos se pegan JUSTO debajo
+/// de la imagen (una fila de margen) en vez de quedarse al fondo de
+/// la terminal lejos del vídeo. Sin letterbox caen en sus filas
+/// reservadas de siempre (encima del HUD).
+#[allow(clippy::too_many_arguments)]
 fn draw_subs_dispatch(
     so: &mut Stdout,
     cols: u16,
     rows: u16,
     hud_lines: u16,
     sub_rows: u16,
+    video_bottom: Option<u16>,
     track: Option<&subs::SubTrack>,
     t: f64,
-    cache: &mut Option<(u16, u16, String)>,
+    cache: &mut Option<(u16, u16, u16, String)>,
 ) {
     if sub_rows == 0 {
         return;
     }
     let Some(track) = track else { return };
     let text = track.query(t).unwrap_or_default();
-    let key = (cols, rows, text);
+    // Fila reservada clásica (justo encima del HUD) = tope inferior.
+    let reserved_first = rows.saturating_sub(hud_lines + sub_rows) + 1;
+    let first_row = match video_bottom {
+        // +2 = una fila en blanco de separación bajo la imagen.
+        Some(vb) => (vb + 2).min(reserved_first),
+        None => reserved_first,
+    };
+    let key = (cols, rows, first_row, text);
     if cache.as_ref() == Some(&key) {
         return;
     }
-    let first_row = rows.saturating_sub(hud_lines + sub_rows) + 1;
-    let lines: Vec<&str> = key.2.lines().collect();
+    // Si la posición cambió (p.ej. resize sin 2J de por medio),
+    // limpiar las filas de la posición anterior antes de pintar.
+    let prev_row = cache.as_ref().map(|(_, _, r, _)| *r);
+    let lines: Vec<&str> = key.3.lines().collect();
     let start = lines.len().saturating_sub(sub_rows as usize);
     let mut sol = so.lock();
+    if let Some(pr) = prev_row {
+        if pr != first_row {
+            for i in 0..sub_rows {
+                let _ = renderer::draw_hud_at(&mut sol, cols, pr + i, "");
+            }
+        }
+    }
     for i in 0..sub_rows {
         let content = lines.get(start + i as usize).copied().unwrap_or("");
         let centered = center_text(content, cols);
-        let _ = renderer::draw_hud_at(&mut sol, cols, first_row + i, &centered);
+        let _ = renderer::draw_sub_line(&mut sol, cols, first_row + i, &centered);
     }
     let _ = sol.flush();
     *cache = Some(key);
@@ -1409,15 +1474,13 @@ fn format_hud_lines(
     let bar = "█".repeat(filled) + &"░".repeat(bar_w - filled);
     let audio_tag = if using_audio { "🔊" } else { "🔇" };
 
-    if hud_lines == 2 {
-        let line1 = format!(
-            " {} [{}] {}/{} · vol {} {} · {} {}×{} (cell {}×{} {}) · {:5.1} fps ({:.0} dec, {} drop)",
-            flag,
-            bar,
-            fmt_time(t),
-            fmt_time(duration),
-            volume,
-            audio_tag,
+    // Bloque de métricas: SOLO con --stats. Antes el HUD de 2 líneas
+    // las mostraba siempre (backend, resolución, celda, fps, drops) y
+    // el flag "no hacía nada"; ahora el HUD por defecto es limpio
+    // (transporte + volumen) y --stats añade la telemetría.
+    let stats_block = || {
+        format!(
+            " · {} {}×{} (cell {}×{} {}) · {:5.1} fps ({:.0} dec, {} drop)",
             backend_name,
             frame_w,
             frame_h,
@@ -1427,46 +1490,55 @@ fn format_hud_lines(
             fps_shown,
             fps_decoded,
             dropped,
+        )
+    };
+
+    if hud_lines == 2 {
+        let mut line1 = format!(
+            " {} [{}] {}/{} · vol {} {}",
+            flag,
+            bar,
+            fmt_time(t),
+            fmt_time(duration),
+            volume,
+            audio_tag,
         );
+        if show_stats {
+            line1.push_str(&stats_block());
+        }
         let line2 =
             " q=salir · ␣=pausa · ←/→=seek ±5s · ↑/↓=vol ±5 · a=pista audio · j=subs".to_string();
         (line1, line2)
-    } else if show_stats {
-        let line = format!(
-            " {} [{}] {}/{} · vol {} {} · {} · {:5.1} fps ({:.0} dec, {} drop) · q=salir",
-            flag,
-            bar,
-            fmt_time(t),
-            fmt_time(duration),
-            volume,
-            audio_tag,
-            backend_name,
-            fps_shown,
-            fps_decoded,
-            dropped,
-        );
-        (line, String::new())
     } else if cols >= 60 {
-        let line = format!(
-            " {} [{}] {}/{} · vol {} {} · {} · {:5.1} fps · q=salir · ␣=pausa · ←/→=seek",
+        let mut line = format!(
+            " {} [{}] {}/{} · vol {} {}",
             flag,
             bar,
             fmt_time(t),
             fmt_time(duration),
             volume,
             audio_tag,
-            backend_name,
-            fps_shown,
         );
+        if show_stats {
+            line.push_str(&stats_block());
+            line.push_str(" · q=salir");
+        } else {
+            line.push_str(" · q=salir · ␣=pausa · ←/→=seek");
+        }
         (line, String::new())
     } else {
-        let line = format!(
-            " {} {}/{} · {:.0} fps · q",
-            flag,
-            fmt_time(t),
-            fmt_time(duration),
-            fps_shown,
-        );
+        let line = if show_stats {
+            format!(
+                " {} {}/{} · {:.0} fps ({} drop) · q",
+                flag,
+                fmt_time(t),
+                fmt_time(duration),
+                fps_shown,
+                dropped,
+            )
+        } else {
+            format!(" {} {}/{} · q", flag, fmt_time(t), fmt_time(duration))
+        };
         (line, String::new())
     }
 }
