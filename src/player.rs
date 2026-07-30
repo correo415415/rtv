@@ -38,6 +38,18 @@ use crate::renderer::{self, Renderer};
 use crate::subs;
 use crate::terminfo::{self, CellPx};
 
+/// Modo de subtítulos (semántica de la CLI):
+///   * `Off`      — sin `--sub`: NO se muestran subtítulos.
+///   * `Embedded` — `--sub` sin valor: pista de texto embebida del
+///     contenedor (la "best" según FFmpeg), si existe.
+///   * `File(p)`  — `--sub fichero`: fichero externo .srt/.ass.
+#[derive(Debug, Clone)]
+pub enum SubMode {
+    Off,
+    Embedded,
+    File(PathBuf),
+}
+
 pub struct Config {
     pub path: PathBuf,
     pub forced_backend: Option<String>,
@@ -46,11 +58,8 @@ pub struct Config {
     pub show_stats: bool,
     pub no_audio: bool,
     pub hw_pref: crate::hwdec::HwPref,
-    /// Subtítulos: fichero externo (.srt/.ass). Si es None se intenta
-    /// la pista embebida "best" del contenedor.
-    pub sub_file: Option<PathBuf>,
-    /// Desactivar subtítulos por completo.
-    pub no_subs: bool,
+    /// Modo de subtítulos (ver `SubMode`).
+    pub sub_mode: SubMode,
 }
 
 struct TerminalGuard {
@@ -153,10 +162,10 @@ pub fn run(cfg: Config) -> Result<()> {
     // los embebidos corre en un hilo propio (demux solo-subs); aquí
     // solo se decide si hay pista → se reservan 2 filas encima del
     // HUD para el texto (fijas toda la sesión: sin saltos de layout).
-    let sub_track: Option<subs::SubTrack> = if cfg.no_subs {
-        None
-    } else {
-        subs::load(&cfg.path, cfg.sub_file.as_deref())
+    let sub_track: Option<subs::SubTrack> = match &cfg.sub_mode {
+        SubMode::Off => None,
+        SubMode::Embedded => subs::load(&cfg.path, None),
+        SubMode::File(p) => subs::load(&cfg.path, Some(p.as_path())),
     };
     let sub_rows_for = |rows: u16, has: bool| -> u16 {
         if has && rows >= 8 {
@@ -363,7 +372,13 @@ pub fn run(cfg: Config) -> Result<()> {
                     //   (3) dec.seek(target)   → decoder vídeo salta con
                     //       keyframe<=target + drop-until-target-PTS.
                     master.set(target);
-                    dec.seek(target);
+                    // Dirección del seek: hacia DELANTE aterriza en el
+                    // keyframe >= target (garantiza avance aunque el
+                    // GOP sea más largo que el paso del seek — AV1 de
+                    // YouTube tiene GOPs de >6 s y con keyframe<=target
+                    // el vídeo se quedaba clavado); hacia ATRÁS en el
+                    // keyframe <= target, como siempre.
+                    dec.seek_dir(target, delta > 0.0);
                     // Descartar el frame en vuelo: su serial ya es viejo.
                     pending = None;
                     // Un seek real drena la cola y re-decodifica con

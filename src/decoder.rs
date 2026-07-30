@@ -200,6 +200,15 @@ pub struct SeekReq {
     /// reproducción continúa y solo cambia la resolución de los
     /// frames que llegan.
     pub refine: bool,
+    /// Dirección del seek (estilo mpv):
+    ///   * `forward=true` (→): aterrizar en el keyframe >= target.
+    ///     Sin esto, con GOPs más largos que el paso del seek (AV1 de
+    ///     YouTube tiene GOPs de >6 s) el keyframe <= target era EL
+    ///     MISMO en cada pulsación y el vídeo se quedaba "clavado" —
+    ///     no se podía adelantar más allá de cierto punto.
+    ///   * `forward=false` (← / restart de loop): keyframe <= target,
+    ///     como siempre.
+    pub forward: bool,
 }
 
 impl DecoderHandle {
@@ -207,6 +216,13 @@ impl DecoderHandle {
     /// El caller (player) DEBE también bumpear el serial del reloj
     /// ANTES de llamar esto (o al mismo tiempo). Ver `MasterClock::set`.
     pub fn seek(&self, target_secs: f64) -> i32 {
+        self.seek_dir(target_secs, false)
+    }
+
+    /// Seek con dirección explícita. `forward=true` aterriza en el
+    /// keyframe >= target (garantiza que un seek hacia delante SIEMPRE
+    /// avanza, aunque el GOP sea más largo que el paso del seek).
+    pub fn seek_dir(&self, target_secs: f64, forward: bool) -> i32 {
         let new_serial = self.serial.fetch_add(1, Ordering::AcqRel) + 1;
         // Drenar frames antiguos del canal para bajar latencia.
         while self.rx.try_recv().is_ok() {}
@@ -217,6 +233,7 @@ impl DecoderHandle {
             target_secs,
             serial: new_serial,
             refine: false,
+            forward,
         });
         new_serial
     }
@@ -239,6 +256,7 @@ impl DecoderHandle {
             target_secs,
             serial: new_serial,
             refine: true,
+            forward: false,
         });
         new_serial
     }
@@ -502,6 +520,22 @@ fn decode_loop(
     let tb_num = f64::from(time_base.numerator());
     let tb_den = f64::from(time_base.denominator());
 
+    // Log de depuración opcional del hilo decoder (RTV_DEC_DEBUG=/ruta).
+    let mut dbg: Option<std::io::BufWriter<std::fs::File>> =
+        std::env::var("RTV_DEC_DEBUG").ok().and_then(|p| {
+            std::fs::File::create(p).ok().map(std::io::BufWriter::new)
+        });
+    let dbg_origin = std::time::Instant::now();
+    macro_rules! dbglog {
+        ($($arg:tt)*) => {
+            if let Some(l) = dbg.as_mut() {
+                use std::io::Write as _;
+                let _ = writeln!(l, "{:.4} {}", dbg_origin.elapsed().as_secs_f64(), format!($($arg)*));
+                let _ = l.flush();
+            }
+        };
+    }
+
     let mut scaler = Scaler::new();
     let mut frame = VideoFrame::empty();
     // Frame de staging para el copy-back GPU→RAM (decode HW). Se
@@ -526,6 +560,8 @@ fn decode_loop(
     // actual de reproducción, sin salto atrás al keyframe). El sws
     // se salta para los descartados — solo se paga el decode.
     let mut drop_until: Option<f64> = None;
+    let mut first_decoded_logged = true;
+    let mut first_emitted_logged = true;
 
     'outer: loop {
         if stop.load(Ordering::Relaxed) {
@@ -559,12 +595,42 @@ fn decode_loop(
             // funcionaba en absoluto.
             let ts_target =
                 (req.target_secs * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
-            let _ = ictx.seek(ts_target, ..=ts_target);
+            // Dirección del aterrizaje (estilo mpv):
+            //   * hacia DELANTE: rango `ts..` → avformat_seek_file con
+            //     min_ts = ts → el demuxer elige el primer keyframe
+            //     >= target. Garantiza avance SIEMPRE: con el rango
+            //     `..=ts` de antes, si el GOP era más largo que el
+            //     paso del seek (AV1 de YouTube: GOPs de >6 s), el
+            //     keyframe <= target era el mismo en cada pulsación
+            //     de → y el vídeo quedaba atascado en ese punto.
+            //     Si falla (target más allá del último keyframe),
+            //     fallback al keyframe <= target.
+            //   * hacia ATRÁS / refine: rango `..=ts` → keyframe
+            //     <= target, como siempre (hr-seek exacto en refine).
+            let seek_res = if req.forward && !req.refine {
+                ictx.seek(ts_target, ts_target..)
+                    .or_else(|_| ictx.seek(ts_target, ..=ts_target))
+            } else {
+                ictx.seek(ts_target, ..=ts_target)
+            };
+            dbglog!("SEEK target={:.3} serial={} refine={} fwd={} res={:?}", req.target_secs, req.serial, req.refine, req.forward, seek_res.as_ref().err());
             decoder.flush();
             // Refinado: descartar hasta el punto exacto (1 ms de
-            // tolerancia por redondeo de PTS). Seek normal: emitir
-            // desde el keyframe (salto instantáneo estilo mpv).
-            drop_until = if req.refine { Some(req.target_secs) } else { None };
+            // tolerancia por redondeo de PTS). Seek normal hacia
+            // ATRÁS: emitir desde el keyframe (salto instantáneo
+            // estilo mpv). Seek hacia DELANTE: también drop-until —
+            // en el caso normal el demuxer ya aterriza en un keyframe
+            // >= target (el primer frame pasa el umbral y no cuesta
+            // nada), pero cerca del FINAL el demuxer MP4 clampea
+            // SILENCIOSAMENTE al último keyframe (sin error): sin el
+            // drop-until, cada → aterrizaba en ese mismo keyframe
+            // ANTERIOR a la posición actual y el vídeo saltaba hacia
+            // atrás — imposible adelantar el último tramo del vídeo.
+            drop_until = if req.refine || req.forward {
+                Some(req.target_secs)
+            } else {
+                None
+            };
             // CATCH-UP RÁPIDO: durante el drop-until-target todos los
             // frames pre-target se descartan sin mostrarse — no hace
             // falta decodificar los NO-referencia (B-frames no-ref):
@@ -584,6 +650,8 @@ fn decode_loop(
             // alineará el audio a su PTS real.
             at_eof = false;
             eof.store(false, Ordering::Relaxed);
+            first_decoded_logged = false;
+            first_emitted_logged = false;
             // No emitimos nada más de la iteración vieja.
             continue;
         }
@@ -601,8 +669,12 @@ fn decode_loop(
                 }
                 p
             }
-            Some(Err(_)) => continue,
+            Some(Err(e)) => {
+                dbglog!("PKT_ERR {:?}", e);
+                continue;
+            }
             None => {
+                dbglog!("EOF_DEMUX serial={}", current_serial);
                 let _ = decoder.send_eof();
                 drain(
                     &mut decoder,
@@ -649,6 +721,10 @@ fn decode_loop(
 
             let pts_ticks = frame.pts().unwrap_or(0);
             let pts_secs = pts_ticks as f64 * tb_num / tb_den;
+            if !first_decoded_logged {
+                first_decoded_logged = true;
+                dbglog!("FIRST_DECODED pts={:.3} serial={}", pts_secs, current_serial);
+            }
 
             // Refinado en curso: descartar los frames del GOP previos
             // al punto actual de reproducción (no re-emitir el pasado).
@@ -687,6 +763,10 @@ fn decode_loop(
                 None => continue,
             };
             last_emitted_pts = pts_secs;
+            if !first_emitted_logged {
+                first_emitted_logged = true;
+                dbglog!("FIRST_EMIT pts={:.3} serial={}", pts_secs, current_serial);
+            }
             if send_with_stop(&tx, out, &stop, &serial_atomic, current_serial).is_err() {
                 break 'outer;
             }

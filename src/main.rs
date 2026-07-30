@@ -51,12 +51,14 @@ struct Cli {
     #[arg(long)]
     no_audio: bool,
 
-    /// Fichero de subtítulos externo (.srt / .ass). Sin él, rtv usa la
-    /// pista de subtítulos de texto embebida del contenedor si existe.
-    #[arg(long)]
-    sub: Option<PathBuf>,
+    /// Subtítulos. SIN esta opción no se muestran subtítulos.
+    /// `--sub` (sin valor) usa la pista de texto embebida del
+    /// contenedor; `--sub fichero.srt|.ass` usa el fichero externo.
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "FICHERO")]
+    sub: Option<String>,
 
-    /// Desactivar subtítulos (ni externos ni embebidos)
+    /// Desactivar subtítulos (redundante ahora: es el comportamiento
+    /// por defecto sin --sub; se mantiene por compatibilidad)
     #[arg(long)]
     no_subs: bool,
 
@@ -101,6 +103,21 @@ fn main() -> Result<()> {
         eprintln!("hwaccels disponibles: {:?}", hwdec::available_types());
     }
 
+    // Semántica de --sub:
+    //   * ausente            → SIN subtítulos (SubMode::Off)
+    //   * `--sub` (vacío)    → pista embebida del contenedor
+    //   * `--sub fichero`    → fichero externo .srt/.ass
+    // `--no-subs` fuerza Off en cualquier caso (compatibilidad).
+    let sub_mode = if cli.no_subs {
+        player::SubMode::Off
+    } else {
+        match cli.sub.as_deref() {
+            None => player::SubMode::Off,
+            Some("") => player::SubMode::Embedded,
+            Some(p) => player::SubMode::File(PathBuf::from(p)),
+        }
+    };
+
     player::run(player::Config {
         path: cli.path,
         forced_backend: cli.backend,
@@ -109,8 +126,7 @@ fn main() -> Result<()> {
         show_stats: cli.stats,
         no_audio: cli.no_audio,
         hw_pref,
-        sub_file: cli.sub,
-        no_subs: cli.no_subs,
+        sub_mode,
     })
 }
 

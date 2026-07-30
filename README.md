@@ -63,13 +63,14 @@ máquina y el terminal, pero los órdenes de magnitud se mantienen.
   BMP en memoria — también vía ssh con `LC_TERMINAL`), **Sixel** real (paleta
   fija 6×7×6 + dithering Bayer ordenado + RLE; mlterm/foot/contour/xterm
   `-ti vt340`), half-blocks truecolor (`▀`, 2 px por celda) y ASCII.
-- **Subtítulos softsub**: SRT y ASS externos (`--sub fichero.srt`) o la pista
-  de texto embebida del contenedor (MKV/MP4), auto-detectada. El texto se
-  pinta centrado en 2 filas reservadas encima del HUD, sin tocar el pipeline
-  de vídeo: la pista embebida se carga en un hilo aparte con demux
-  solo-subtítulos (`AVDISCARD_ALL` en el resto de streams) y el lookup por
-  tiempo es una búsqueda binaria por frame. Tags ASS `{\...}` y HTML de SRT
-  fuera; `--no-subs` lo desactiva todo.
+- **Subtítulos softsub (opt-in)**: por defecto no se muestra ningún
+  subtítulo. Con `--sub` (sin valor) se usa la pista de texto embebida del
+  contenedor (MKV/MP4), y con `--sub fichero.srt` (o `.ass`) se carga un
+  fichero externo. El texto se pinta centrado en 2 filas reservadas encima
+  del HUD, sin tocar el pipeline de vídeo: la pista embebida se carga en un
+  hilo aparte con demux solo-subtítulos (`AVDISCARD_ALL` en el resto de
+  streams) y el lookup por tiempo es una búsqueda binaria por frame. Tags
+  ASS `{\...}` y HTML de SRT fuera.
 - **HUD discreto**: barra de progreso, tiempo, volumen y fps en 1–2 líneas
   que se adaptan al ancho. Solo se repinta cuando cambia (nada de parpadeo)
   y desaparece si la ventana es demasiado pequeña para ser legible.
@@ -123,8 +124,8 @@ rtv <fichero> [opciones]
 | `--loop-video` | Reinicia al llegar al final |
 | `--stats` | FPS mostrados/decodificados y drops en el HUD |
 | `--no-audio` | Sin audio; el vídeo usa reloj monotónico |
-| `--sub <fichero.srt\|.ass>` | Subtítulos externos. Sin esta opción se usa la pista de texto embebida del contenedor si existe |
-| `--no-subs` | Desactiva subtítulos (externos y embebidos) |
+| `--sub [fichero.srt\|.ass]` | Activa subtítulos: sin valor usa la pista de texto embebida del contenedor; con fichero carga subtítulos externos. Sin `--sub` no se muestran subtítulos |
+| `--no-subs` | Desactiva subtítulos aunque se pase `--sub` (compatibilidad) |
 | `--hwdec <auto\|none\|vaapi\|cuda\|qsv\|d3d11va\|dxva2\|videotoolbox\|vulkan\|drm\|vdpau>` | Decode por hardware. `auto` (default) prueba los hwaccels de la plataforma y cae a software si ninguno funciona; `none` fuerza software |
 | `--verbose` | Deja los logs de FFmpeg en stderr (debugging) y lista los hwaccels compilados |
 
