@@ -1161,6 +1161,19 @@ pub fn run(cfg: Config) -> Result<()> {
     }
 
     // Cleanup.
+    // Sync-log: flush + fsync EXPLÍCITOS antes de salir. El log se
+    // flushea línea a línea, pero en algunos filesystems (9p/WSL,
+    // overlays de sandbox, NFS) los datos de un proceso recién muerto
+    // pueden tardar unos ms en ser visibles para un lector externo:
+    // el test de integración leía el fichero justo tras wait() y veía
+    // 0 filas con el fichero ya completo (flaky ~1/6). sync_all()
+    // fuerza los datos a estable ANTES de que exit() sea observable.
+    if let Some(mut log) = sync_log.take() {
+        let _ = log.flush();
+        if let Ok(f) = log.into_inner() {
+            let _ = f.sync_all();
+        }
+    }
     if let Some(mut a) = audio_handle.take() {
         a.stop();
     }

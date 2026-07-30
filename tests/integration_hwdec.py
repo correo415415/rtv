@@ -76,20 +76,36 @@ def run_mode(mode):
     os.close(master)
     os.close(slave)
 
-    rows = []
-    try:
-        with open(log_path) as f:
-            for line in f:
-                if line.startswith("#"):
-                    continue
-                p = line.split()
-                if len(p) >= 4:
-                    try:
-                        rows.append((float(p[0]), float(p[3])))
-                    except ValueError:
-                        pass  # cabecera
-    except FileNotFoundError:
-        pass
+    # Lectura ROBUSTA del sync-log: en este sandbox (y en general en
+    # filesystems con caché visible con retardo — 9p/WSL, overlays) un
+    # read() inmediatamente después de wait() puede devolver 0 bytes
+    # aunque stat() ya reporte el tamaño final; unos ms después el
+    # mismo fichero devuelve todo el contenido. Era la causa del flaky
+    # "0 frames en un modo aleatorio con exit 0" (~1/6 ejecuciones):
+    # rtv sí reproducía y escribía el log completo. Reintentamos hasta
+    # 2 s si la lectura sale vacía.
+    def read_rows():
+        out = []
+        try:
+            with open(log_path) as f:
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    p = line.split()
+                    if len(p) >= 4:
+                        try:
+                            out.append((float(p[0]), float(p[3])))
+                        except ValueError:
+                            pass  # cabecera
+        except FileNotFoundError:
+            pass
+        return out
+
+    rows = read_rows()
+    deadline = time.time() + 2.0
+    while not rows and time.time() < deadline:
+        time.sleep(0.05)
+        rows = read_rows()
     try:
         os.unlink(log_path)
     except OSError:
