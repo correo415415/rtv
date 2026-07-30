@@ -66,12 +66,15 @@ máquina y el terminal, pero los órdenes de magnitud se mantienen.
 - **Subtítulos softsub (opt-in)**: por defecto no se muestra ningún
   subtítulo. Con `--sub` (sin valor) se usa la pista de texto embebida del
   contenedor (MKV/MP4), y con `--sub fichero.srt` (o `.ass`) se carga un
-  fichero externo. El texto se pinta centrado en 2 filas reservadas encima
-  del HUD, sin tocar el pipeline de vídeo: la pista embebida se carga en un
+  fichero externo. El texto se pinta centrado, en negrita y blanco
+  brillante, pegado justo debajo de la imagen (si hay letterbox) o en las
+  2 filas reservadas encima del HUD, sin tocar el pipeline de vídeo: la
+  pista embebida se carga en un
   hilo aparte con demux solo-subtítulos (`AVDISCARD_ALL` en el resto de
   streams) y el lookup por tiempo es una búsqueda binaria por frame. Tags
   ASS `{\...}` y HTML de SRT fuera.
-- **HUD discreto**: barra de progreso, tiempo, volumen y fps en 1–2 líneas
+- **HUD discreto**: barra de progreso, tiempo y volumen en 1–2 líneas
+  (con `--stats` añade backend, resolución, celda, fps y drops)
   que se adaptan al ancho. Solo se repinta cuando cambia (nada de parpadeo)
   y desaparece si la ventana es demasiado pequeña para ser legible.
 - **Terminal siempre limpio**: alt-screen, autowrap desactivado durante la
@@ -122,7 +125,7 @@ rtv <fichero> [opciones]
 | `--backend <kitty\|iterm2\|sixel\|blocks\|ascii>` | Fuerza un backend (por defecto se auto-detecta) |
 | `--scale <0.1..1.0>` | Limita la resolución de render. Útil en terminales 4K donde el decode software no da abasto |
 | `--loop-video` | Reinicia al llegar al final |
-| `--stats` | FPS mostrados/decodificados y drops en el HUD |
+| `--stats` | Telemetría en el HUD: backend, resolución, tamaño de celda, FPS mostrados/decodificados y drops (sin el flag el HUD es limpio: transporte + volumen) |
 | `--no-audio` | Sin audio; el vídeo usa reloj monotónico |
 | `--sub [fichero.srt\|.ass]` | Activa subtítulos: sin valor usa la pista de texto embebida del contenedor; con fichero carga subtítulos externos. Sin `--sub` no se muestran subtítulos |
 | `--no-subs` | Desactiva subtítulos aunque se pase `--sub` (compatibilidad) |

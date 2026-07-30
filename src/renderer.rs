@@ -226,24 +226,33 @@ impl Renderer {
             col_ox as u32,
             row_oy as u32,
         );
+        // Synchronized output (DEC 2026): el terminal acumula todo lo
+        // que llegue entre ?2026h y ?2026l y lo presenta en UN solo
+        // refresco. Elimina el flash negro visible entre el clear (2J)
+        // y el repintado del frame (p.ej. al pulsar `j` con cambio de
+        // layout, o en resizes). Windows Terminal, kitty, WezTerm,
+        // foot, iTerm2… lo soportan; el resto lo ignora sin daño.
+        out.write_all(b"\x1b[?2026h")?;
         let mut cleared = false;
         if self.last_layout != Some(layout) {
-            self.scratch.clear();
-            self.scratch.extend_from_slice(b"\x1b[2J\x1b[H");
-            out.write_all(&self.scratch)?;
+            out.write_all(b"\x1b[2J\x1b[H")?;
             self.last_layout = Some(layout);
             cleared = true;
         }
 
-        match self.backend {
-            Backend::Kitty => self.draw_kitty(out, frame, max_cols, max_rows, col_ox, row_oy)?,
-            Backend::Iterm2 => self.draw_iterm2(out, frame, max_cols, max_rows, col_ox, row_oy)?,
-            Backend::Sixel => self.draw_sixel(out, frame, max_cols, max_rows, col_ox, row_oy)?,
+        let res = match self.backend {
+            Backend::Kitty => self.draw_kitty(out, frame, max_cols, max_rows, col_ox, row_oy),
+            Backend::Iterm2 => self.draw_iterm2(out, frame, max_cols, max_rows, col_ox, row_oy),
+            Backend::Sixel => self.draw_sixel(out, frame, max_cols, max_rows, col_ox, row_oy),
             Backend::HalfBlocks => {
-                self.draw_halfblocks(out, frame, max_cols, max_rows, col_ox, row_oy)?
+                self.draw_halfblocks(out, frame, max_cols, max_rows, col_ox, row_oy)
             }
-            Backend::Ascii => self.draw_ascii(out, frame, max_cols, max_rows, col_ox, row_oy)?,
-        }
+            Backend::Ascii => self.draw_ascii(out, frame, max_cols, max_rows, col_ox, row_oy),
+        };
+        // Cerrar el batch SIEMPRE, incluso si el backend falló — un
+        // ?2026h colgado congelaría la pantalla del terminal.
+        out.write_all(b"\x1b[?2026l")?;
+        res?;
         Ok(cleared)
     }
 
@@ -700,6 +709,26 @@ pub fn draw_hud_at(out: &mut StdoutLock, cols: u16, row: u16, line: &str) -> Res
     write!(
         out,
         "\x1b[0m\x1b[{};1H{}{}\x1b[0m",
+        row,
+        content,
+        " ".repeat(pad_needed),
+    )?;
+    Ok(())
+}
+
+/// Línea de subtítulo: como `draw_hud_at` pero con estilo propio —
+/// negrita + blanco brillante sobre el fondo de la terminal, que es
+/// como los pintan los reproductores de vídeo y lo que hace el texto
+/// legible sobre el letterbox (antes salían con el estilo por defecto
+/// del terminal, finos y grises, difíciles de leer — ver captura del
+/// issue). El padding a ancho completo va SIN estilo para no pintar
+/// una franja de fondo.
+pub fn draw_sub_line(out: &mut StdoutLock, cols: u16, row: u16, line: &str) -> Result<()> {
+    let (content, content_width) = truncate_to_width(line, cols as usize);
+    let pad_needed = (cols as usize).saturating_sub(content_width);
+    write!(
+        out,
+        "\x1b[0m\x1b[{};1H\x1b[1;97m{}\x1b[0m{}",
         row,
         content,
         " ".repeat(pad_needed),

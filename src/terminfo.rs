@@ -46,6 +46,12 @@ impl CellPxSource {
     }
 }
 
+/// Timeout del sondeo. En Unix el roundtrip es local (PTY) y 20 ms
+/// sobran. En Windows la respuesta atraviesa conpty (WT ⇄ conhost ⇄
+/// proceso) y puede tardar bastante más; como el sondeo corre UNA sola
+/// vez al arrancar, 150 ms no se notan y evitan falsos negativos.
+const PROBE_TIMEOUT_MS: u64 = if cfg!(windows) { 150 } else { 20 };
+
 /// Devuelve el tamaño de celda, con las reglas descritas en el docstring del
 /// módulo. `cols`/`rows` son el tamaño lógico del terminal (por si CSI 14t
 /// nos devuelve el área total y hay que dividir).
@@ -54,7 +60,7 @@ pub fn probe_cell_px(cols: u16, rows: u16) -> CellPx {
         return heuristic();
     }
     // Ahora sí, intentamos CSI 16t (timeout ultra-corto).
-    if let Some((h, w)) = query_and_parse(b"\x1b[16t", b't', 6, 20) {
+    if let Some((h, w)) = query_and_parse(b"\x1b[16t", b't', 6, PROBE_TIMEOUT_MS) {
         if w > 0 && h > 0 && w < 200 && h < 200 {
             return CellPx {
                 w,
@@ -64,7 +70,7 @@ pub fn probe_cell_px(cols: u16, rows: u16) -> CellPx {
         }
     }
     // Intento 2: CSI 14t (tamaño total del área de texto).
-    if let Some((total_h, total_w)) = query_and_parse(b"\x1b[14t", b't', 4, 20) {
+    if let Some((total_h, total_w)) = query_and_parse(b"\x1b[14t", b't', 4, PROBE_TIMEOUT_MS) {
         if cols > 0 && rows > 0 && total_w > 0 && total_h > 0 {
             let cw = (total_w / cols as u32).max(1);
             let ch = (total_h / rows as u32).max(1);
@@ -96,10 +102,19 @@ fn heuristic() -> CellPx {
 /// Lista blanca conservadora: solo activamos el sondeo cuando estamos MUY
 /// seguros de que va a responder. Si dudamos, heurística.
 fn terminal_supports_pixel_query() -> bool {
-    // Windows: NUNCA sondear. Windows Terminal y consolas legacy no responden.
+    // Windows: SOLO Windows Terminal. WT moderno (el único con sixel en
+    // Windows) SÍ responde a CSI 16t/14t (microsoft/terminal#8581); las
+    // consolas legacy (conhost, cmd) no, y sondearlas solo quema el
+    // timeout. WT exporta WT_SESSION en todos sus perfiles.
+    //
+    // Esto arregla el "vídeo descentrado y pequeño" en WT con sixel: la
+    // heurística 8×16 subestima la celda real (p.ej. Cascadia Mono a
+    // tamaños/DPI típicos es 9×19-12×24) → rtv creía llenar el ancho
+    // (offset 0) pero la imagen quedaba arriba-izquierda ocupando ~80%.
     #[cfg(windows)]
     {
-        return false;
+        return std::env::var("WT_SESSION").is_ok()
+            || std::env::var("WT_PROFILE_ID").is_ok();
     }
 
     #[cfg(not(windows))]
@@ -109,6 +124,10 @@ fn terminal_supports_pixel_query() -> bool {
 
         // Kitty: env var propia y TERM=xterm-kitty.
         if std::env::var("KITTY_WINDOW_ID").is_ok() {
+            return true;
+        }
+        // Windows Terminal vía WSL: mismo caso que en Windows nativo.
+        if std::env::var("WT_SESSION").is_ok() {
             return true;
         }
         if term.contains("kitty") {
@@ -193,7 +212,118 @@ fn query_and_parse(
     parse_response(&buf, terminator, expected_prefix)
 }
 
-#[cfg(not(unix))]
+/// Windows: la respuesta del terminal llega por el buffer de entrada de
+/// la consola como KEY_EVENTs (con ENABLE_VIRTUAL_TERMINAL_INPUT, que
+/// crossterm ya activó con el raw mode — el sondeo corre DESPUÉS de
+/// `TerminalGuard::enter`). La leemos con `ReadConsoleInputW` usando
+/// `WaitForSingleObject` como timeout real, sin bloquear jamás: si el
+/// terminal no contesta, a los `timeout_ms` seguimos con heurística.
+/// FFI a mano (3 funciones de kernel32) para no arrastrar `winapi`.
+#[cfg(windows)]
+fn query_and_parse(
+    query: &[u8],
+    terminator: u8,
+    expected_prefix: u32,
+    timeout_ms: u64,
+) -> Option<(u32, u32)> {
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const WAIT_OBJECT_0: u32 = 0;
+    const KEY_EVENT: u16 = 0x0001;
+
+    // Layout exacto de KEY_EVENT_RECORD / INPUT_RECORD (wincon.h):
+    // INPUT_RECORD = { WORD EventType; <pad 2>; union Event (16 bytes) }.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct KeyEventRecord {
+        key_down: i32,
+        repeat_count: u16,
+        virtual_key_code: u16,
+        virtual_scan_code: u16,
+        unicode_char: u16,
+        control_key_state: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InputRecord {
+        event_type: u16,
+        _pad: u16,
+        event: KeyEventRecord,
+    }
+    extern "system" {
+        fn GetStdHandle(n: u32) -> isize;
+        fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+        fn ReadConsoleInputW(
+            h: isize,
+            buf: *mut InputRecord,
+            len: u32,
+            read: *mut u32,
+        ) -> i32;
+    }
+
+    let hin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if hin == 0 || hin == -1 {
+        return None;
+    }
+
+    let mut out = std::io::stdout();
+    out.write_all(query).ok()?;
+    out.flush().ok()?;
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = (deadline - now).as_millis().max(1) as u32;
+        if unsafe { WaitForSingleObject(hin, remaining) } != WAIT_OBJECT_0 {
+            break; // timeout o error → sin respuesta
+        }
+        // Hay eventos: leerlos (esto también DESENCOLA eventos no-tecla
+        // — focus, ratón — que mantendrían el handle señalizado).
+        let zero = InputRecord {
+            event_type: 0,
+            _pad: 0,
+            event: KeyEventRecord {
+                key_down: 0,
+                repeat_count: 0,
+                virtual_key_code: 0,
+                virtual_scan_code: 0,
+                unicode_char: 0,
+                control_key_state: 0,
+            },
+        };
+        let mut recs = [zero; 16];
+        let mut nread: u32 = 0;
+        if unsafe { ReadConsoleInputW(hin, recs.as_mut_ptr(), 16, &mut nread) } == 0 {
+            break;
+        }
+        for r in recs.iter().take(nread as usize) {
+            if r.event_type != KEY_EVENT || r.event.key_down == 0 {
+                continue;
+            }
+            let ch = r.event.unicode_char;
+            if ch == 0 || ch > 255 {
+                continue;
+            }
+            for _ in 0..r.event.repeat_count.max(1) {
+                buf.push(ch as u8);
+            }
+            if ch as u8 == terminator {
+                return parse_response(&buf, terminator, expected_prefix);
+            }
+            // Sanity: demasiados bytes sin terminador → input real del
+            // usuario, no la respuesta del sondeo.
+            if buf.len() > 40 {
+                return None;
+            }
+        }
+    }
+    parse_response(&buf, terminator, expected_prefix)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn query_and_parse(
     _query: &[u8],
     _terminator: u8,
