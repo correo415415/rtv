@@ -148,15 +148,20 @@ def main():
         check("evento 2 visible", "Segunda línea de prueba" in txt)
         check("tags HTML eliminados", "<i>" not in txt)
 
-        print("== 4) subs embebidos MKV ==")
-        out, rc = run([mkv, "--no-audio", "--backend", "blocks"], secs=7)
+        print("== 4) subs embebidos MKV (--sub sin valor) ==")
+        out, rc = run([mkv, "--sub", "--no-audio", "--backend", "blocks"], secs=7)
         txt = out.decode("utf-8", "replace")
         check("pista embebida visible", "Hola mundo subtitulado" in txt)
 
-        print("== 5) --no-subs ==")
-        out, rc = run([mkv, "--no-subs", "--no-audio", "--backend", "blocks"], secs=6)
+        print("== 5) sin --sub → sin subtítulos (default) ==")
+        out, rc = run([mkv, "--no-audio", "--backend", "blocks"], secs=6)
         txt = out.decode("utf-8", "replace")
-        check("sin texto de subs", "Hola mundo subtitulado" not in txt)
+        check("sin texto de subs por defecto", "Hola mundo subtitulado" not in txt)
+
+        print("== 5b) --no-subs (compat) ==")
+        out, rc = run([mkv, "--sub", "--no-subs", "--no-audio", "--backend", "blocks"], secs=6)
+        txt = out.decode("utf-8", "replace")
+        check("--no-subs gana a --sub", "Hola mundo subtitulado" not in txt)
 
         print("== 6) regresión kitty / blocks ==")
         out, rc = run([video, "--backend", "kitty", "--no-audio"], secs=4)

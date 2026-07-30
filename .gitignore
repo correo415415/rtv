@@ -1,3 +1,6 @@
 /target
 testdata/
 testmedia/
+*.mp4
+*.mkv
+*.webm
