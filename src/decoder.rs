@@ -263,11 +263,41 @@ impl DecoderHandle {
         hwdec::name_of_raw(self.hw_state.load(Ordering::Acquire))
     }
 
+    /// Parada cooperativa SIN riesgo de hang (bug histórico: el
+    /// `join()` sin timeout colgaba la salida ~25 % de las veces con
+    /// decode saturado — HEVC 1080p+, canal lleno):
+    ///   1. Señala `stop` y DRENA el canal EN BUCLE mientras espera:
+    ///      un solo drenaje no basta — si el hilo estaba dormido en el
+    ///      backoff de `send_with_stop`, puede colar otro frame en el
+    ///      hueco recién abierto y volver a llenar el canal.
+    ///   2. `join` acotado (500 ms) vía `is_finished()`: si el hilo
+    ///      sigue dentro de una llamada FFmpeg bloqueante y NO
+    ///      interrumpible por el flag (avcodec_send_packet /
+    ///      receive_frame con frame-threading saturado, av_read_frame
+    ///      sobre I/O lenta), se le suelta (detach) — el proceso está
+    ///      saliendo y el SO recoge el hilo. JAMÁS se cuelga la
+    ///      terminal del usuario esperando a FFmpeg.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        while self.rx.try_recv().is_ok() {}
         if let Some(j) = self.join.take() {
-            let _ = j.join();
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            loop {
+                // Drenar SIEMPRE antes de mirar el estado del hilo:
+                // abre hueco para que un try_send en vuelo complete y
+                // el hilo llegue al siguiente check de `stop`.
+                while self.rx.try_recv().is_ok() {}
+                if j.is_finished() {
+                    let _ = j.join();
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // Detach de último recurso: no bloqueamos la
+                    // salida por un hilo atascado dentro de FFmpeg.
+                    drop(j);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 }

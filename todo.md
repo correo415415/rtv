@@ -300,3 +300,76 @@ Riesgos conocidos:
       por eso la Fase 0 exige medir antes de comprometerse.
     * AV1 hw decode escasea; el default `auto` debe degradar por codec, no
       globalmente (p.ej. VAAPI para HEVC pero software para AV1 en una iGPU vieja).
+
+---
+
+# Tarea 5 (COMPLETADA): backends reales Sixel e iTerm2 + subtítulos softsub
+
+    [x] Backend Sixel REAL (antes caía a halfblocks): DCS `ESC P 0;1;0 q`,
+        paleta fija de 252 registros (cubo RGB 6×7×6, re-emitida por frame
+        para los registros privados de xterm), dithering ordenado Bayer 4×4,
+        codificación por bandas de 6 filas con RLE `!n`. Autodetección por
+        TERM (sixel/mlterm/foot/contour).
+    [x] Backend iTerm2 REAL: OSC 1337 `File=inline=1` + BMP 24bpp sin
+        comprimir en memoria, dims en CELDAS (Retina-safe). Autodetección
+        por TERM_PROGRAM=iTerm.app y LC_TERMINAL=iTerm2 (ssh).
+    [x] Subtítulos softsub SRT/ASS: archivo externo (--sub) con parsers
+        puros en Rust, y pista embebida del contenedor decodificada en un
+        hilo propio (demux con AVDISCARD_ALL en el resto de streams).
+        --no-subs lo desactiva. 2 filas reservadas sobre el HUD, texto
+        centrado, caché anti-parpadeo.
+    [x] tests/integration_backends_subs.py: 6 grupos de checks en pty real
+        (sixel válido, BMP byte-exacto, subs externos/embebidos/--no-subs,
+        regresión kitty/blocks). Unit tests de parsers 14/14.
+
+# Tarea 6 (COMPLETADA): salida robusta bajo decode saturado (bug nº1)
+
+    Reporte: hang intermitente (~25 % con HEVC 1080p) al pulsar `q` con el
+    decoder saturado — el `join()` sin timeout de `DecoderHandle::stop()`.
+
+    Diagnóstico confirmado por revisión de código: aunque `send_with_stop`
+    y `drain` son stop-aware, el `stop()` viejo drenaba el canal UNA sola
+    vez antes del join. Si el hilo estaba dormido en el backoff (2 ms) de
+    `send_with_stop`, podía colar otro frame en el hueco recién abierto y
+    volver a llenar el canal; y si estaba dentro de una llamada FFmpeg
+    bloqueante (send_packet/receive_frame con frame-threading saturado,
+    av_read_frame en I/O lenta) el flag no puede interrumpirla → join
+    eterno → terminal colgada. Mismo patrón en `AudioHandle::stop()`.
+
+    [x] Fix `DecoderHandle::stop()`: drena el canal EN BUCLE mientras
+        espera + join acotado a 500 ms vía `is_finished()`; si el hilo
+        sigue atascado dentro de FFmpeg se le suelta (detach) — el proceso
+        está saliendo y el SO lo recoge. La salida NUNCA se cuelga.
+    [x] Fix espejo en `AudioHandle::stop()` (join acotado 500 ms + detach).
+    [x] tests/stress_exit_hang.py: 20-30 ejecuciones HEVC 1080p en pty
+        pequeño (canal saturado), q en momentos aleatorios, mitad con
+        tormenta de seeks previa; exige salida en <2 s. Resultado tras el
+        fix: 30/30 salidas limpias (0-32 ms). Nota: en este sandbox el
+        hang original no llegó a reproducirse en 70 intentos (2 cores
+        decodifican 1080p HEVC de sobra); el fix elimina la clase entera
+        de bloqueo por diseño (join acotado), no solo el síntoma.
+
+# 🔜 FUTURO (anotado, NO implementar todavía): cambio de pista en runtime
+
+    Objetivo: teclas para ciclar pista de AUDIO (`#` estilo mpv o `a`) y de
+    SUBTÍTULOS (`j`/`J`) durante la reproducción, sin cortar el playback.
+
+    Diseño previsto (cuando se aborde):
+      * Inventario de pistas al abrir: enumerar streams audio/sub con
+        (index, lang, title, codec) y mostrarlos en el HUD al ciclar.
+      * Audio: `AudioHandle` necesita un mensaje `SwitchTrack(stream_idx)`
+        → el hilo audio-decoder reabre el decoder sobre el stream nuevo,
+        flushea el resampler y re-ancla el reloj en el PTS actual (mismo
+        mecanismo que el seek: bump de serial para silenciar chunks viejos).
+        OJO: si la pista nueva tiene layout/sample_rate distinto, recrear
+        SwrCtx; el sink cpal NO se toca (formato de salida fijo).
+      * Subtítulos: más simple — `subs::load_embedded` ya decodifica en un
+        hilo propio; bastaría parametrizar el stream_index elegido y
+        relanzar el hilo (los eventos son un Vec compartido bajo Mutex;
+        limpiar + recargar). Ciclar también entre embebida ↔ externa.
+      * CLI complementario: `--alang/--slang` (elegir por idioma al abrir)
+        y `--aid/--sid` (por índice), como mpv.
+      * Tests: MKV con 2 pistas de audio (tonos distintos L/R) y 2 de subs
+        (idiomas distintos) generado con ffmpeg; verificar en pty que el
+        ciclado cambia el texto mostrado y no rompe el sync (|avdiff| <60 ms
+        tras el cambio).

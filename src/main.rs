@@ -18,6 +18,7 @@ mod hwdec;
 mod input;
 mod player;
 mod renderer;
+mod subs;
 mod terminfo;
 
 use anyhow::Result;
@@ -49,6 +50,15 @@ struct Cli {
     /// Desactivar audio (usa reloj monotónico)
     #[arg(long)]
     no_audio: bool,
+
+    /// Fichero de subtítulos externo (.srt / .ass). Sin él, rtv usa la
+    /// pista de subtítulos de texto embebida del contenedor si existe.
+    #[arg(long)]
+    sub: Option<PathBuf>,
+
+    /// Desactivar subtítulos (ni externos ni embebidos)
+    #[arg(long)]
+    no_subs: bool,
 
     /// Decode por hardware: auto | none | vaapi | cuda | qsv | d3d11va |
     /// dxva2 | videotoolbox | vulkan | drm | vdpau. `auto` prueba los
@@ -99,6 +109,8 @@ fn main() -> Result<()> {
         show_stats: cli.stats,
         no_audio: cli.no_audio,
         hw_pref,
+        sub_file: cli.sub,
+        no_subs: cli.no_subs,
     })
 }
 

@@ -58,8 +58,18 @@ máquina y el terminal, pero los órdenes de magnitud se mantienen.
   ~1 ms (espera inter-frame interrumpible por eventos + reescalado inmediato
   del frame en pantalla), y el decoder reajusta `sws_scale` sin drenar su
   colchón de pre-decode ni perder el sync.
-- **Tres backends de render** con auto-detección: Kitty graphics protocol
-  (píxeles reales), half-blocks truecolor (`▀`, 2 px por celda) y ASCII.
+- **Cinco backends de render** con auto-detección: Kitty graphics protocol
+  (píxeles reales; Kitty/Ghostty/WezTerm), **iTerm2 inline images** (OSC 1337,
+  BMP en memoria — también vía ssh con `LC_TERMINAL`), **Sixel** real (paleta
+  fija 6×7×6 + dithering Bayer ordenado + RLE; mlterm/foot/contour/xterm
+  `-ti vt340`), half-blocks truecolor (`▀`, 2 px por celda) y ASCII.
+- **Subtítulos softsub**: SRT y ASS externos (`--sub fichero.srt`) o la pista
+  de texto embebida del contenedor (MKV/MP4), auto-detectada. El texto se
+  pinta centrado en 2 filas reservadas encima del HUD, sin tocar el pipeline
+  de vídeo: la pista embebida se carga en un hilo aparte con demux
+  solo-subtítulos (`AVDISCARD_ALL` en el resto de streams) y el lookup por
+  tiempo es una búsqueda binaria por frame. Tags ASS `{\...}` y HTML de SRT
+  fuera; `--no-subs` lo desactiva todo.
 - **HUD discreto**: barra de progreso, tiempo, volumen y fps en 1–2 líneas
   que se adaptan al ancho. Solo se repinta cuando cambia (nada de parpadeo)
   y desaparece si la ventana es demasiado pequeña para ser legible.
@@ -113,6 +123,8 @@ rtv <fichero> [opciones]
 | `--loop-video` | Reinicia al llegar al final |
 | `--stats` | FPS mostrados/decodificados y drops en el HUD |
 | `--no-audio` | Sin audio; el vídeo usa reloj monotónico |
+| `--sub <fichero.srt\|.ass>` | Subtítulos externos. Sin esta opción se usa la pista de texto embebida del contenedor si existe |
+| `--no-subs` | Desactiva subtítulos (externos y embebidos) |
 | `--hwdec <auto\|none\|vaapi\|cuda\|qsv\|d3d11va\|dxva2\|videotoolbox\|vulkan\|drm\|vdpau>` | Decode por hardware. `auto` (default) prueba los hwaccels de la plataforma y cae a software si ninguno funciona; `none` fuerza software |
 | `--verbose` | Deja los logs de FFmpeg en stderr (debugging) y lista los hwaccels compilados |
 
@@ -203,9 +215,15 @@ Piezas clave:
 - **`player.rs`** — el loop: input, sync, decisión de drop/espera, render y
   HUD. Las esperas se hacen con `event::poll`, así que cualquier tecla o
   resize interrumpe la espera y se atiende al instante.
-- **`renderer.rs`** — los tres backends. Todos recortan a los límites
-  reales del área de vídeo, de modo que un frame con dimensiones desfasadas
-  (resize en vuelo) nunca desborda la pantalla.
+- **`renderer.rs`** — los cinco backends (kitty, iTerm2, Sixel,
+  halfblocks, ascii). Todos recortan a los límites reales del área de
+  vídeo, de modo que un frame con dimensiones desfasadas (resize en
+  vuelo) nunca desborda la pantalla.
+- **`subs.rs`** — subtítulos softsub: parsers SRT/ASS puros en Rust para
+  archivos externos (`--sub`) y un hilo demuxer/decoder propio para la
+  pista embebida del contenedor (con `AVDISCARD_ALL` en el resto de
+  streams para que el demux de subs sea casi gratis). El player consulta
+  los eventos activos por PTS con búsqueda binaria en cada refresco.
 - **`terminfo.rs`** — sondeo del tamaño de celda (CSI `16t`/`14t`) con
   timeout de 20 ms y lista blanca de terminales que responden; heurística
   8×16 para el resto. En Windows nunca se sondea.
@@ -226,6 +244,7 @@ rtv/
 │   ├── audio.rs             # hilo de audio + sink cpal
 │   ├── clock.rs             # relojes ffplay-style
 │   ├── renderer.rs          # backends de render + HUD
+│   ├── subs.rs              # subtítulos softsub SRT/ASS (externos y embebidos)
 │   ├── terminfo.rs          # detección del tamaño de celda
 │   └── input.rs             # eventos de teclado/resize
 └── tests/
@@ -233,7 +252,9 @@ rtv/
     ├── integration_resize.py     # tormenta de resizes + seeks + pausa
     ├── integration_resize_ux.py  # latencia de resize, parpadeo, límites
     ├── integration_grow_quality.py # recuperación de calidad al agrandar
-    └── integration_hwdec.py      # --hwdec: fallback transparente y CLI
+    ├── integration_hwdec.py      # --hwdec: fallback transparente y CLI
+    ├── integration_backends_subs.py # Sixel/iTerm2 reales + subs SRT/ASS/embebidos
+    └── stress_exit_hang.py       # salida limpia bajo decode saturado (HEVC)
 ```
 
 ## Tests
