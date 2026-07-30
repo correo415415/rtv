@@ -37,6 +37,7 @@ use crate::input::{self, Cmd};
 use crate::renderer::{self, Renderer};
 use crate::subs;
 use crate::terminfo::{self, CellPx};
+use crate::tracks::{self, TrackInfo};
 
 /// Modo de subtítulos (semántica de la CLI):
 ///   * `Off`      — sin `--sub`: NO se muestran subtítulos.
@@ -60,6 +61,54 @@ pub struct Config {
     pub hw_pref: crate::hwdec::HwPref,
     /// Modo de subtítulos (ver `SubMode`).
     pub sub_mode: SubMode,
+    /// Pista de audio inicial: índice 1-based dentro de las pistas de
+    /// audio (--aid) / idioma (--alang).
+    pub aid: Option<usize>,
+    pub alang: Option<String>,
+    /// Pista de subtítulos embebida inicial (--sid / --slang).
+    pub sid: Option<usize>,
+    pub slang: Option<String>,
+}
+
+/// Una opción del ciclo de subtítulos (tecla `j`/`J`):
+/// Off → [externa si hay] → embebida 1 → embebida 2 → … → Off.
+enum SubChoice {
+    Off,
+    External(PathBuf),
+    /// stream_index REAL en el contenedor.
+    Embedded(usize),
+}
+
+/// Carga la opción de subtítulos elegida. Devuelve (pista, etiqueta
+/// para el OSD).
+fn load_sub_choice(
+    media: &std::path::Path,
+    choice: &SubChoice,
+    sub_tracks: &[TrackInfo],
+) -> (Option<subs::SubTrack>, String) {
+    match choice {
+        SubChoice::Off => (None, "off".to_string()),
+        SubChoice::External(p) => {
+            let t = subs::load_external_file(p);
+            let label = match &t {
+                Some(t) => format!("{} (externo)", t.label),
+                None => "error cargando fichero".to_string(),
+            };
+            (t, label)
+        }
+        SubChoice::Embedded(sidx) => {
+            let t = subs::load_embedded_track(media, *sidx);
+            let label = sub_tracks
+                .iter()
+                .find(|ti| ti.stream_index == *sidx)
+                .map(|ti| ti.label())
+                .unwrap_or_else(|| "embebida".to_string());
+            match &t {
+                Some(_) => (t, label),
+                None => (None, format!("{label} — error")),
+            }
+        }
+    }
 }
 
 struct TerminalGuard {
@@ -134,15 +183,29 @@ pub fn run(cfg: Config) -> Result<()> {
     audclk_pre.set_staleness(0.25);
     let vidclk = FfClock::new();
 
+    // --- Inventario de pistas del contenedor (audio + subs texto) ---
+    let (audio_tracks, sub_tracks) = tracks::probe(&cfg.path);
+
     // --- Audio (opcional) ---
+    // Pista inicial: --aid (1-based) / --alang, con fallback a la
+    // "best" de FFmpeg si no hay match.
+    let start_audio_stream = tracks::select(&audio_tracks, cfg.aid, cfg.alang.as_deref())
+        .map(|pos| audio_tracks[pos].stream_index);
     let mut audio_handle: Option<AudioHandle> = if cfg.no_audio {
         None
     } else {
-        match audio::spawn(&cfg.path, audclk_pre.clone()) {
+        match audio::spawn(&cfg.path, audclk_pre.clone(), start_audio_stream) {
             Ok(h) if h.has_audio => Some(h),
             _ => None,
         }
     };
+    // Posición de la pista de audio activa dentro de `audio_tracks`
+    // (para el ciclado con `a`/`#`).
+    let mut cur_audio_pos: usize = audio_handle
+        .as_ref()
+        .and_then(|a| a.track_index)
+        .and_then(|si| audio_tracks.iter().position(|t| t.stream_index == si))
+        .unwrap_or(0);
     let using_audio = audio_handle.as_ref().map(|a| a.has_audio).unwrap_or(false);
 
     // MasterClock: elige audclk o vidclk como maestro.
@@ -159,13 +222,37 @@ pub fn run(cfg: Config) -> Result<()> {
     }
 
     // Subtítulos softsub (externos --sub o embebidos). La carga de
-    // los embebidos corre en un hilo propio (demux solo-subs); aquí
-    // solo se decide si hay pista → se reservan 2 filas encima del
-    // HUD para el texto (fijas toda la sesión: sin saltos de layout).
-    let sub_track: Option<subs::SubTrack> = match &cfg.sub_mode {
-        SubMode::Off => None,
-        SubMode::Embedded => subs::load(&cfg.path, None),
-        SubMode::File(p) => subs::load(&cfg.path, Some(p.as_path())),
+    // los embebidos corre en un hilo propio (demux solo-subs).
+    //
+    // CICLO de pistas (tecla `j`/`J`): Off → [externa] → embebidas.
+    // El estado es (sub_choices, sub_choice_idx); al ciclar se
+    // recarga la pista elegida (los eventos cargan en ms–s en un
+    // hilo propio, sin tocar vídeo/audio/relojes).
+    let mut sub_choices: Vec<SubChoice> = vec![SubChoice::Off];
+    if let SubMode::File(p) = &cfg.sub_mode {
+        sub_choices.push(SubChoice::External(p.clone()));
+    }
+    for t in &sub_tracks {
+        sub_choices.push(SubChoice::Embedded(t.stream_index));
+    }
+    let mut sub_choice_idx: usize = match &cfg.sub_mode {
+        SubMode::Off => 0,
+        SubMode::File(_) => 1,
+        SubMode::Embedded => {
+            if sub_tracks.is_empty() {
+                0
+            } else {
+                // --sid/--slang eligen pista concreta; sin ellos, la
+                // primera pista de texto del contenedor.
+                let pos = tracks::select(&sub_tracks, cfg.sid, cfg.slang.as_deref()).unwrap_or(0);
+                1 + pos // +1 por el Off inicial (sin externa en este modo)
+            }
+        }
+    };
+    let mut sub_track: Option<subs::SubTrack> = if sub_choice_idx == 0 {
+        None
+    } else {
+        load_sub_choice(&cfg.path, &sub_choices[sub_choice_idx], &sub_tracks).0
     };
     let sub_rows_for = |rows: u16, has: bool| -> u16 {
         if has && rows >= 8 {
@@ -178,6 +265,11 @@ pub fn run(cfg: Config) -> Result<()> {
     // Caché del último texto de subtítulo pintado (anti-parpadeo,
     // misma filosofía que HudCache).
     let mut sub_cache: Option<(u16, u16, String)> = None;
+
+    // OSD transitorio del HUD (feedback al ciclar pistas): texto +
+    // instante de creación; se muestra ~2.5 s en la línea 1 del HUD
+    // y caduca solo (el HudCache detecta el cambio de texto).
+    let mut osd: Option<(String, Instant)> = None;
 
     // Decoder vídeo.
     let mut hud_lines = hud_rows_for(cols, rows);
@@ -405,6 +497,108 @@ pub fn run(cfg: Config) -> Result<()> {
                         a.set_volume(volume);
                     }
                 }
+                Cmd::CycleAudio(dir) => {
+                    // Cambio de pista de audio EN CALIENTE, sin cortar
+                    // el playback. Mismo protocolo que un seek al
+                    // instante actual:
+                    //   (1) master.set(now) — bumpea seriales: los
+                    //       chunks de la pista vieja que queden en el
+                    //       ring se silencian y no tocan el reloj.
+                    //   (2) audio.switch_track(stream, now) — el hilo
+                    //       reabre el decoder sobre el stream nuevo
+                    //       (codec/rate/layout propios), recrea el
+                    //       resampler y aterriza en `now` con recorte
+                    //       sample-accurate.
+                    // El vídeo NO se toca: entra en el hold estándar
+                    // (master desanclado → muestra el frame actual y
+                    // espera) y al llegar el primer chunk de la pista
+                    // nueva el reloj ancla y todo continúa en sync.
+                    if audio_handle.is_none() {
+                        osd = Some(("Audio: sin audio".to_string(), Instant::now()));
+                    } else if audio_tracks.len() < 2 {
+                        let label = audio_tracks
+                            .first()
+                            .map(|t| t.label())
+                            .unwrap_or_else(|| "única".to_string());
+                        osd = Some((format!("Audio: {label} (única pista)"), Instant::now()));
+                    } else {
+                        let n = audio_tracks.len();
+                        cur_audio_pos =
+                            (cur_audio_pos as i64 + dir as i64).rem_euclid(n as i64) as usize;
+                        let track = &audio_tracks[cur_audio_pos];
+                        let now_t = master.now().max(0.0);
+                        master.set(now_t);
+                        if let Some(a) = audio_handle.as_ref() {
+                            a.switch_track(track.stream_index, now_t);
+                        }
+                        // NO es un seek de vídeo: el decoder sigue y el
+                        // aterrizaje del audio ancla el reloj en now_t.
+                        pending_audio_landing = false;
+                        frame_timer = wall_now_f64();
+                        if master.is_paused() {
+                            // En pausa el reloj queda re-apuntado; al
+                            // reanudar sonará la pista nueva desde aquí.
+                            show_one_frame_paused = false;
+                        }
+                        osd = Some((
+                            format!("Audio [{}/{}]: {}", cur_audio_pos + 1, n, track.label()),
+                            Instant::now(),
+                        ));
+                    }
+                }
+                Cmd::CycleSubs(dir) => {
+                    // Ciclo: Off → [externa --sub] → embebidas → Off.
+                    let n = sub_choices.len();
+                    if n <= 1 {
+                        osd = Some(("Subs: no hay pistas".to_string(), Instant::now()));
+                    } else {
+                        sub_choice_idx =
+                            (sub_choice_idx as i64 + dir as i64).rem_euclid(n as i64) as usize;
+                        let (t, label) =
+                            load_sub_choice(&cfg.path, &sub_choices[sub_choice_idx], &sub_tracks);
+                        sub_track = t;
+                        sub_cache = None;
+                        osd = Some((
+                            format!("Subs [{}/{}]: {}", sub_choice_idx + 1, n, label),
+                            Instant::now(),
+                        ));
+                        // ¿Cambia el layout? (aparecen/desaparecen las
+                        // 2 filas reservadas) → recomputar dims y
+                        // redibujar YA el último frame (como un resize).
+                        let new_sub_rows = sub_rows_for(rows, sub_track.is_some());
+                        if new_sub_rows != sub_rows {
+                            sub_rows = new_sub_rows;
+                            let (nw, nh, _, _) = compute_layout(
+                                backend,
+                                dec.source_size,
+                                cols,
+                                rows,
+                                cell_px,
+                                cfg.scale,
+                                hud_lines + sub_rows,
+                            );
+                            dst_w = nw;
+                            dst_h = nh;
+                            dec.resize(dst_w, dst_h);
+                            hud_cache = None;
+                            renderer_.reset_layout_cache();
+                            force_full_redraw = true;
+                            if let Some(f) = last_frame.as_mut() {
+                                rescale_frame_nearest(f, dst_w, dst_h);
+                                let vid_rows =
+                                    rows.saturating_sub(hud_lines + sub_rows).max(1);
+                                let (ox, oy) = offsets_for_frame(
+                                    backend, cell_px, f.width, f.height, cols, vid_rows,
+                                );
+                                let mut sol = so.lock();
+                                let _ = write!(&mut sol, "\x1b[2J\x1b[H");
+                                let _ = renderer_.draw(&mut sol, f, cols, vid_rows, ox, oy);
+                                let _ = sol.flush();
+                                force_full_redraw = false;
+                            }
+                        }
+                    }
+                }
                 Cmd::Resize(c, r) => {
                     // RESIZE robusto e INSTANTÁNEO: NO tocamos relojes,
                     // ni sync, ni la cola de frames. Solo (1) recalcular
@@ -461,6 +655,17 @@ pub fn run(cfg: Config) -> Result<()> {
                 }
                 Cmd::None => {}
             }
+        }
+
+        // 1.2) Caducidad del OSD de cambio de pista (~2.5 s): al
+        //      volver osd a None el texto del HUD cambia y el
+        //      HudCache fuerza el repintado — sin timers extra.
+        if osd
+            .as_ref()
+            .map(|(_, t0)| t0.elapsed() > Duration::from_millis(2500))
+            .unwrap_or(false)
+        {
+            osd = None;
         }
 
         // 1.5) Disparo del REFINADO de calidad (debounce vencido).
@@ -592,6 +797,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 using_audio,
                 cfg.show_stats,
                 true,
+                osd.as_ref().map(|(s, _)| s.as_str()),
                 &mut hud_cache,
             );
             continue;
@@ -747,6 +953,7 @@ pub fn run(cfg: Config) -> Result<()> {
                 using_audio,
                 cfg.show_stats,
                 false,
+                osd.as_ref().map(|(s, _)| s.as_str()),
                 &mut hud_cache,
             );
             last_frame = Some(frame);
@@ -911,6 +1118,7 @@ pub fn run(cfg: Config) -> Result<()> {
             using_audio,
             cfg.show_stats,
             false,
+            osd.as_ref().map(|(s, _)| s.as_str()),
             &mut hud_cache,
         );
         last_frame = Some(frame);
@@ -1072,6 +1280,7 @@ fn draw_hud_dispatch(
     using_audio: bool,
     show_stats: bool,
     paused: bool,
+    osd: Option<&str>,
     cache: &mut HudCache,
 ) {
     // Terminal minúscula: HUD oculto — no hay nada legible que pintar
@@ -1084,7 +1293,7 @@ fn draw_hud_dispatch(
         let _ = sol.flush();
         return;
     }
-    let (l1, l2) = format_hud_lines(
+    let (mut l1, l2) = format_hud_lines(
         clock,
         duration,
         volume,
@@ -1101,6 +1310,12 @@ fn draw_hud_dispatch(
         cols,
         hud_lines,
     );
+    // OSD transitorio (cambio de pista): sustituye la línea principal
+    // del HUD mientras está activo — entra en la key del caché, así
+    // que aparece y desaparece con un solo repintado.
+    if let Some(o) = osd {
+        l1 = format!(" ▸ {o}");
+    }
     // Caché anti-parpadeo: si el HUD no cambió (mismo tamaño de
     // terminal y mismo texto), NO se reescribe la fila. El HUD solo
     // cambia ~1 vez/s (el reloj), pero se despachaba a fps completos
@@ -1213,7 +1428,8 @@ fn format_hud_lines(
             fps_decoded,
             dropped,
         );
-        let line2 = " q=salir · ␣=pausa · ←/→=seek ±5s · ↑/↓=vol ±5".to_string();
+        let line2 =
+            " q=salir · ␣=pausa · ←/→=seek ±5s · ↑/↓=vol ±5 · a=pista audio · j=subs".to_string();
         (line1, line2)
     } else if show_stats {
         let line = format!(

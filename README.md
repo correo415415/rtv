@@ -126,6 +126,8 @@ rtv <fichero> [opciones]
 | `--no-audio` | Sin audio; el vídeo usa reloj monotónico |
 | `--sub [fichero.srt\|.ass]` | Activa subtítulos: sin valor usa la pista de texto embebida del contenedor; con fichero carga subtítulos externos. Sin `--sub` no se muestran subtítulos |
 | `--no-subs` | Desactiva subtítulos aunque se pase `--sub` (compatibilidad) |
+| `--aid <N>` / `--alang <idioma>` | Pista de audio inicial: por índice 1-based dentro de las pistas de audio (`--aid 2` = segunda) o por idioma (`--alang spa`), como mpv. Sin match → pista "best" de FFmpeg |
+| `--sid <N>` / `--slang <idioma>` | Pista de subtítulos embebida inicial (por índice de pista de texto / por idioma). Implican subtítulos ON aunque no se pase `--sub` |
 | `--hwdec <auto\|none\|vaapi\|cuda\|qsv\|d3d11va\|dxva2\|videotoolbox\|vulkan\|drm\|vdpau>` | Decode por hardware. `auto` (default) prueba los hwaccels de la plataforma y cae a software si ninguno funciona; `none` fuerza software |
 | `--verbose` | Deja los logs de FFmpeg en stderr (debugging) y lista los hwaccels compilados |
 
@@ -169,7 +171,25 @@ H.264 en la misma máquina vaya por GPU.
 | `Espacio` | Pausa / reanudar (también el audio) |
 | `←` / `→` | Seek ±5 s |
 | `↑` / `↓` | Volumen ±5 (0–200 %) |
+| `a` / `#` (`A` = atrás) | Cicla la pista de AUDIO en caliente, sin cortar el playback (el HUD muestra la pista con un OSD de ~2.5 s) |
+| `j` (`J` = atrás) | Cicla subtítulos: off → [externa `--sub`] → pistas embebidas → off |
 | `q` / `Esc` / `Ctrl+C` | Salir |
+
+#### Cambio de pista en runtime
+
+El cambio de audio reutiliza el protocolo de seek: se bumpean los
+seriales de los relojes (los chunks de la pista vieja que queden en el
+ring se silencian sin tocar el reloj), el hilo de audio reabre el
+decoder sobre el stream nuevo — cada pista puede tener codec,
+sample-rate y layout distintos; el resampler normaliza siempre al
+formato fijo del sink — y aterriza en el instante actual con recorte
+sample-accurate. El vídeo ni se entera: entra en el hold estándar de
+master desanclado y continúa en sync al primer chunk de la pista nueva
+(|avdiff| mediano medido tras el cambio: <1 ms).
+
+Los subtítulos son más simples: cada pista embebida se decodifica en un
+hilo propio de demux-solo-subs al seleccionarla, y `off` simplemente
+suelta la pista (las 2 filas reservadas se devuelven al vídeo).
 
 ## Arquitectura
 
@@ -246,6 +266,7 @@ rtv/
 │   ├── clock.rs             # relojes ffplay-style
 │   ├── renderer.rs          # backends de render + HUD
 │   ├── subs.rs              # subtítulos softsub SRT/ASS (externos y embebidos)
+│   ├── tracks.rs            # inventario de pistas + selección --aid/--alang/--sid/--slang
 │   ├── terminfo.rs          # detección del tamaño de celda
 │   └── input.rs             # eventos de teclado/resize
 └── tests/
@@ -255,6 +276,7 @@ rtv/
     ├── integration_grow_quality.py # recuperación de calidad al agrandar
     ├── integration_hwdec.py      # --hwdec: fallback transparente y CLI
     ├── integration_backends_subs.py # Sixel/iTerm2 reales + subs SRT/ASS/embebidos
+    ├── integration_tracks.py     # cambio de pista audio/subs en runtime + CLI
     └── stress_exit_hang.py       # salida limpia bajo decode saturado (HEVC)
 ```
 
@@ -298,9 +320,6 @@ Pendiente:
 
 - [ ] Medir la ganancia de `--hwdec` en una máquina con GPU real
       (el sandbox de CI no tiene `/dev/dri`)
-- [ ] Sixel real para xterm/mlterm
-- [ ] Protocolo iTerm2 nativo (`ESC ] 1337 ; File=`)
-- [ ] Subtítulos softsub (SRT/ASS)
 - [ ] Barra de progreso clicable con ratón
 
 ## Licencia

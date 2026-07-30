@@ -13,6 +13,11 @@ pub enum Cmd {
     SeekRel(f64),
     VolumeDelta(i32),
     Resize(u16, u16),
+    /// Ciclar pista de AUDIO (+1 = siguiente, -1 = anterior).
+    CycleAudio(i32),
+    /// Ciclar pista de SUBTÍTULOS (+1 = siguiente, -1 = anterior;
+    /// el ciclo incluye "off" y la pista externa de --sub si la hay).
+    CycleSubs(i32),
     None,
 }
 
@@ -40,6 +45,13 @@ pub fn poll_command() -> std::io::Result<Vec<Cmd>> {
                     (KeyCode::Right, _) => Cmd::SeekRel(5.0),
                     (KeyCode::Up, _) => Cmd::VolumeDelta(5),
                     (KeyCode::Down, _) => Cmd::VolumeDelta(-5),
+                    // Cambio de pista en runtime (estilo mpv: `#`
+                    // cicla audio, `j`/`J` cicla subtítulos). `a`/`A`
+                    // como alias más cómodo para audio.
+                    (KeyCode::Char('a'), _) | (KeyCode::Char('#'), _) => Cmd::CycleAudio(1),
+                    (KeyCode::Char('A'), _) => Cmd::CycleAudio(-1),
+                    (KeyCode::Char('j'), _) => Cmd::CycleSubs(1),
+                    (KeyCode::Char('J'), _) => Cmd::CycleSubs(-1),
                     _ => Cmd::None,
                 };
                 if !matches!(cmd, Cmd::None) {
