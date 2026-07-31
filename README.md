@@ -97,9 +97,10 @@ tar -xzf rtv-*-linux-x86_64.tar.gz && cd rtv-*/ && ./rtv vídeo.mp4
 En Windows: descomprime el `.zip` y ejecuta `rtv.exe vídeo.mp4` (las DLLs de
 FFmpeg van junto al exe). El binario debe quedarse junto a su carpeta
 `lib/`/`libs/` (Linux/macOS) o junto a las DLLs (Windows). Los paquetes se
-generan en CI ([`ci/build.yml`](ci/build.yml) — se activa con
-`bash ci/activar-workflow.sh`, ver ese script); también puedes bajar los
-artefactos de cualquier ejecución del workflow.
+generan en CI ([`ci/build.yml`](ci/build.yml) es la fuente canónica; tras
+cambiarla se sincroniza a `.github/workflows/` con
+`bash ci/activar-workflow.sh`); también puedes bajar los artefactos de
+cualquier ejecución del workflow.
 
 ### Compilar desde fuente
 
