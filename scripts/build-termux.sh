@@ -29,6 +29,16 @@ if [ -z "${TERMUX_VERSION:-}" ] && ! echo "${PREFIX:-}" | grep -q com.termux; th
     echo "AVISO: esto no parece Termux (PREFIX=${PREFIX:-?}). Continuando..." >&2
 fi
 
+# En Termux no existe /bin/sh: los shebangs #!/bin/sh se reescriben con el
+# shim termux-exec, que el login shell carga vía LD_PRELOAD. Si entramos
+# sin login (docker exec del CI, ssh directo...), lo cargamos a mano.
+if [ -z "${LD_PRELOAD:-}" ] && [ -n "${PREFIX:-}" ]; then
+    for _so in "$PREFIX/lib/libtermux-exec-ld-preload.so" \
+               "$PREFIX/lib/libtermux-exec.so"; do
+        [ -f "$_so" ] && { export LD_PRELOAD="$_so"; break; }
+    done
+fi
+
 # ---------------------------------------------------------------- deps --
 say "Instalando dependencias de build (pkg)"
 # binutils: ar/ranlib para las crates *-sys. libdav1d = decode AV1 decente.
@@ -61,7 +71,9 @@ else
     # Config mínima para rtv: solo DECODE (sin avfilter/avdevice ni
     # encoders/muxers). Igual que el build Linux del CI pero sin VAAPI
     # (no hay /dev/dri accesible en Android sin root).
-    ./configure --prefix="$FF_PREFIX" \
+    # `sh ./configure`: el shebang del tarball es #!/bin/sh, que no existe
+    # en Termux (cinturón extra por si el LD_PRELOAD de arriba no aplica).
+    sh ./configure --prefix="$FF_PREFIX" \
         --enable-shared --disable-static \
         --disable-programs --disable-doc \
         --disable-avdevice --disable-avfilter \
