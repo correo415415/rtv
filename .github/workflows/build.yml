@@ -58,7 +58,7 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -76,7 +76,7 @@ jobs:
 
       - name: Cache de FFmpeg compilado
         id: ffcache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/ffmpeg
           key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-vaapi-${{ matrix.runner }}-v1
@@ -172,7 +172,7 @@ jobs:
           # maneja mal el stdin no-TTY y el hijo moría con SIGABRT (exit 134).
           python3 ci/smoke_pty.py /tmp/smoke-pkg/rtv /tmp/smoke.mp4
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.pkg.outputs.pkg }}
           path: ${{ steps.pkg.outputs.pkg }}.tar.gz
@@ -183,7 +183,7 @@ jobs:
     name: windows-x86_64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -202,18 +202,21 @@ jobs:
       # El LLVM 20.1.8 preinstalado en windows-latest crashea (STATUS_ACCESS_
       # VIOLATION en el build script de ffmpeg-sys-the-third): clang-sys 1.8.1
       # (fijado por el Cargo.lock) soporta libclang hasta la 18 -> LLVM 18.
+      # Descarga directa del release oficial (antes se usaba KyleMayes/
+      # install-llvm-action, pero sigue en Node 20 -> warning de deprecacion).
+      # Solo hace falta libclang.dll + los headers builtin de clang, que se
+      # extraen selectivamente del instalador NSIS con 7z (preinstalado).
       - name: Instalar LLVM 18 (libclang compatible con clang-sys 1.8)
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "18"
-          # Dir limpio: el default (C:\Program Files\LLVM) mezclaría con el
-          # LLVM 20 preinstalado del runner.
-          directory: C:\llvm18
-
-      - name: Fijar LIBCLANG_PATH a LLVM 18
         shell: pwsh
         run: |
-          "LIBCLANG_PATH=$env:LLVM_PATH\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe"
+          curl.exe -fsSL --retry 5 --retry-all-errors -o C:\llvm18.exe $url
+          # Extraer solo lo que necesita clang-sys/bindgen (dir limpio: el
+          # default C:\Program Files\LLVM mezclaria con el LLVM 20 del runner).
+          7z x C:\llvm18.exe -oC:\llvm18 "bin\libclang.dll" "lib\clang" | Out-Null
+          if (-not (Test-Path C:\llvm18\bin\libclang.dll)) { throw "falta libclang.dll" }
+          "LIBCLANG_PATH=C:\llvm18\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Compilar
         run: cargo build --release --locked
@@ -250,7 +253,7 @@ jobs:
           & "$env:TEMP\smoke-pkg\rtv.exe" --version
           if ($LASTEXITCODE -ne 0) { throw "smoke test falló" }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.pkg.outputs.pkg }}
           path: ${{ steps.pkg.outputs.pkg }}.zip
@@ -269,7 +272,7 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -280,7 +283,7 @@ jobs:
 
       - name: Cache de FFmpeg compilado
         id: ffcache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/ffmpeg
           key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-${{ matrix.runner }}-v1
@@ -358,7 +361,7 @@ jobs:
           # funciona desde otra ruta, la relocación @executable_path es correcta.
           "$TMPDIR/smoke-pkg/rtv" --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.pkg.outputs.pkg }}
           path: ${{ steps.pkg.outputs.pkg }}.tar.gz
@@ -373,13 +376,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Crear GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/*
           generate_release_notes: true
