@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# Activa el workflow de CI moviéndolo a .github/workflows/ (requiere permisos
-# de humano: los tokens de la GitHub App del asistente no tienen el permiso
-# `workflows` y GitHub rechaza que suban ficheros ahí).
+# Sincroniza ci/build.yml -> .github/workflows/build.yml y lo pushea.
 #
-# Uso (desde la raíz del repo, en la rama main ya mergeada):
-#   bash ci/activar-workflow.sh
+# Por qué existe: el token de la GitHub App del asistente no tiene el permiso
+# `workflows`, así que no puede tocar .github/workflows/. La fuente canónica
+# del workflow vive en ci/build.yml (que sí puede editar en sus PRs); tras
+# mergear un PR que lo cambie, ejecuta esto con tus credenciales:
+#
+#   git checkout main && git pull && bash ci/activar-workflow.sh
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+if diff -q ci/build.yml .github/workflows/build.yml >/dev/null 2>&1; then
+  echo "Ya está sincronizado; nada que hacer."
+  exit 0
+fi
 mkdir -p .github/workflows
-git mv ci/build.yml .github/workflows/build.yml
-git commit -m "ci: activar workflow de builds multiplataforma"
+cp ci/build.yml .github/workflows/build.yml
+git add .github/workflows/build.yml
+git commit -m "ci: sincronizar workflow desde ci/build.yml"
 git push
 echo
 echo "Listo. Pruébalo en Actions -> build -> Run workflow, o crea una release:"
