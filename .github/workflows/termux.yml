@@ -19,6 +19,17 @@ name: termux
 
 on:
   workflow_dispatch:
+  # Trigger temporal para validar el workflow desde la rama del PR
+  # (workflow_dispatch solo funciona con el fichero ya en main).
+  # TODO: quitar este bloque push tras el merge.
+  push:
+    branches: [genspark_ai_developer]
+    paths:
+      - ".github/workflows/termux.yml"
+      - "scripts/build-termux.sh"
+      - "ci/**"
+      - "src/**"
+      - "Cargo.*"
 
 env:
   CARGO_TERM_COLOR: always
