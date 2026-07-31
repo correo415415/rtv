@@ -24,11 +24,11 @@
 
 name: build
 
-# Nota: sin filtro `paths` a propósito — GitHub también lo evalúa en pushes
-# de tags y podría saltarse una release si el commit etiquetado no tocó src/.
+# Disparadores: SOLO manual (Actions -> build -> Run workflow) y tags v*
+# (crear una release es un acto deliberado, no "subir un commit").
+# A propósito NO se ejecuta en pushes a main.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -70,7 +70,7 @@ jobs:
       - name: Descargar FFmpeg ${{ env.FF_BRANCH }} shared (BtbN)
         run: |
           url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n${FF_BRANCH}-latest-${{ matrix.btbn }}-lgpl-shared-${FF_BRANCH}.tar.xz"
-          curl -fsSL --retry 3 -o /tmp/ffmpeg.tar.xz "$url"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg.tar.xz "$url"
           mkdir -p "$HOME/ffmpeg"
           tar -xf /tmp/ffmpeg.tar.xz -C "$HOME/ffmpeg" --strip-components=1
           echo "FFMPEG_DIR=$HOME/ffmpeg" >> "$GITHUB_ENV"
@@ -122,10 +122,10 @@ jobs:
           # el vídeo; su RPATH viene roto, de ahí el LD_LIBRARY_PATH puntual).
           LD_LIBRARY_PATH="$FFMPEG_DIR/lib" "$FFMPEG_DIR/bin/ffmpeg" -y \
             -f lavfi -i testsrc2=size=320x180:rate=30 -t 2 -c:v mpeg4 -an /tmp/smoke.mp4
-          cd /tmp
-          TERM=xterm-256color timeout 30 script -qec \
-            "/tmp/smoke-pkg/rtv --no-audio --backend ascii /tmp/smoke.mp4" /dev/null > /dev/null
-          echo "smoke OK"
+          # Harness pty propio (winsize fijo + drenaje continuo + volcado de
+          # diagnóstico si falla): el `script` de util-linux 2.37 del runner
+          # maneja mal el stdin no-TTY y el hijo moría con SIGABRT (exit 134).
+          python3 ci/smoke_pty.py /tmp/smoke-pkg/rtv /tmp/smoke.mp4
 
       - uses: actions/upload-artifact@v4
         with:
@@ -153,10 +153,22 @@ jobs:
           $inner = Get-ChildItem C:\ffdl -Directory | Select-Object -First 1
           Move-Item $inner.FullName C:\ffmpeg
           "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          # bindgen necesita libclang; el runner trae LLVM preinstalado.
-          if (Test-Path "C:\Program Files\LLVM\bin") {
-            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
+
+      # El LLVM 20.1.8 preinstalado en windows-latest crashea (STATUS_ACCESS_
+      # VIOLATION en el build script de ffmpeg-sys-the-third): clang-sys 1.8.1
+      # (fijado por el Cargo.lock) soporta libclang hasta la 18 -> LLVM 18.
+      - name: Instalar LLVM 18 (libclang compatible con clang-sys 1.8)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+          # Dir limpio: el default (C:\Program Files\LLVM) mezclaría con el
+          # LLVM 20 preinstalado del runner.
+          directory: C:\llvm18
+
+      - name: Fijar LIBCLANG_PATH a LLVM 18
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=$env:LLVM_PATH\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Compilar
         run: cargo build --release --locked
@@ -232,10 +244,14 @@ jobs:
         if: steps.ffcache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 -o /tmp/ffmpeg-src.tar.xz \
+          # Espejo de GitHub como primario: ffmpeg.org resetea conexiones
+          # desde los runners (curl 35). Fallback a ffmpeg.org por si acaso.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg-src.tar \
+            "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n${FF_SRC_VERSION}.tar.gz" || \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg-src.tar \
             "https://ffmpeg.org/releases/ffmpeg-${FF_SRC_VERSION}.tar.xz"
           mkdir -p /tmp/ffmpeg-src
-          tar -xf /tmp/ffmpeg-src.tar.xz -C /tmp/ffmpeg-src --strip-components=1
+          tar -xf /tmp/ffmpeg-src.tar -C /tmp/ffmpeg-src --strip-components=1
           cd /tmp/ffmpeg-src
           export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           # Config mínima para rtv: solo DECODE. Sin avfilter/avdevice (la
