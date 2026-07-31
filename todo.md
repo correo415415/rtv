@@ -469,7 +469,8 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
           (TERMUX_VERSION/PREFIX) prueba pulse→cpal; en el resto cpal→pulse.
           Backend explícito NO hace fallback. Log del backend con --verbose.
     [x] Fase 3 — CI SIN dispositivo físico (mejor que el compile-check
-        propuesto): .github/workflows/termux.yml (workflow_dispatch) usa
+        propuesto): jobs termux-* integrados en build.yml (antes workflow
+        separado termux.yml, fusionado a petición del usuario) usan
         imágenes termux/termux-docker — userland Termux REAL — en matriz
         x86_64 (ubuntu-latest) + aarch64 nativo (ubuntu-22.04-arm):
         build vía scripts/build-termux.sh (FFmpeg cacheado con actions/cache),
@@ -483,7 +484,16 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
 ## Validación local (sandbox, PulseAudio 17 + null-sink)
 
     cargo check default y --no-default-features --features pulse: OK.
-    cargo test: 18/18. actionlint termux.yml: limpio.
+    cargo test: 18/18. actionlint: limpio (salvo falso positivo
+    macos-15-intel preexistente).
+    Verificado EN ACTIONS (run 30660071584): termux-x86_64 y termux-aarch64
+    en verde — build nativo + smoke + audio real PulseAudio + CLI checks.
+    Fixes que hicieron falta en el contenedor: docker exec -u 1000 (pkg
+    prohíbe root) y shebangs /bin/sh sin login shell (LD_PRELOAD de
+    termux-exec + sh ./configure).
+    Además: release desde build.yml vía workflow_dispatch con inputs
+    release_tag / release_message (Markdown, \n = salto de línea) /
+    prerelease; tabla de descargas ampliada con los paquetes termux.
     termux_audio_check con pulse: 301 callbacks, PTS max 5.912 s,
     monotonía 100%. auto: OK. Simulación TERMUX_VERSION → auto elige
     pulse. --audio-backend patata → exit 2. El flujo del contenedor se
