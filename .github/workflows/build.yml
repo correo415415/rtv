@@ -6,12 +6,17 @@
 # (ver BUILD-WINDOWS.md). 7.1.x es la única rama que compila.
 #
 # Estrategia por SO (todo validado):
-#   * Linux (x86_64 + arm64): builds oficiales BtbN "lgpl-shared" (los mismos
-#     que recomienda BUILD-WINDOWS.md para Windows). Se compila con FFMPEG_DIR
-#     (soportado por el build.rs de ffmpeg-sys-the-third) y se empaquetan las
-#     5 .so junto al binario con RPATH=$ORIGIN/lib (patchelf). Las libs BtbN
-#     solo exigen glibc>=2.28 y el binario libasound2 (presente en cualquier
-#     Linux de escritorio): el paquete funciona desde cualquier ruta.
+#   * Linux (x86_64 + arm64): FFmpeg 7.1.5 compilado desde fuente (config
+#     mínima LGPL: solo decode, + dav1d para AV1 y VAAPI para hwdec) y
+#     cacheado. NO se usan los builds BtbN aquí: sus .so llevan stubs
+#     implib-gen que hacen dlopen perezoso de libva/libvdpau/etc. y ABORTAN
+#     con assert si la lib no está instalada — rtv crasheaba al sondear
+#     --hwdec auto en cualquier máquina sin libva (visto en CI). Con el
+#     build propio libva va enlazada dinámicamente Y empaquetada: si en la
+#     máquina del usuario no hay driver VAAPI, av_hwdevice_ctx_create falla
+#     LIMPIO y rtv cae a software. Se empaqueta el cierre completo de deps
+#     no-sistema con RPATH $ORIGIN (patchelf); requisitos del usuario:
+#     glibc >= 2.35 (Ubuntu 22.04+) y libasound2.
 #   * Windows (x86_64): BtbN "win64-lgpl-shared" (equivalente al winget
 #     BtbN.FFmpeg.*.Shared.7.1 que usa BUILD-WINDOWS.md). FFMPEG_DIR + las
 #     5 DLLs copiadas junto a rtv.exe (Windows resuelve DLLs del dir del exe).
@@ -34,9 +39,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Rama de BtbN/FFmpeg-Builds (release "latest", assets ffmpeg-n7.1-latest-*).
+  # Rama de BtbN/FFmpeg-Builds para Windows (release "latest").
   FF_BRANCH: "7.1"
-  # Tarball fuente para macOS (último 7.1.x publicado en ffmpeg.org).
+  # Tarball fuente para Linux y macOS (último 7.1.x publicado).
   FF_SRC_VERSION: "7.1.5"
 
 jobs:
@@ -49,10 +54,8 @@ jobs:
         include:
           - runner: ubuntu-22.04       # glibc 2.35 -> compatible hacia delante
             arch: x86_64
-            btbn: linux64
           - runner: ubuntu-22.04-arm   # runners ARM gratis en repos públicos
             arch: arm64
-            btbn: linuxarm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -64,26 +67,63 @@ jobs:
       - name: Dependencias del sistema
         run: |
           sudo apt-get update
+          # ffmpeg (el CLI de apt) es solo para generar el vídeo del smoke
+          # test; nasm para el asm x86 de FFmpeg; dav1d/va/drm se enlazan
+          # dinámicamente y se empaquetan en el artefacto.
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev pkg-config patchelf clang libclang-dev
+            libasound2-dev pkg-config patchelf clang libclang-dev nasm \
+            libdav1d-dev libva-dev libdrm-dev ffmpeg
 
-      - name: Descargar FFmpeg ${{ env.FF_BRANCH }} shared (BtbN)
+      - name: Cache de FFmpeg compilado
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg
+          key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-vaapi-${{ matrix.runner }}-v1
+
+      - name: Compilar FFmpeg ${{ env.FF_SRC_VERSION }} desde fuente (LGPL mínimo)
+        if: steps.ffcache.outputs.cache-hit != 'true'
         run: |
-          url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n${FF_BRANCH}-latest-${{ matrix.btbn }}-lgpl-shared-${FF_BRANCH}.tar.xz"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg.tar.xz "$url"
-          mkdir -p "$HOME/ffmpeg"
-          tar -xf /tmp/ffmpeg.tar.xz -C "$HOME/ffmpeg" --strip-components=1
-          echo "FFMPEG_DIR=$HOME/ffmpeg" >> "$GITHUB_ENV"
+          set -euo pipefail
+          # Espejo de GitHub primario (ffmpeg.org resetea conexiones desde
+          # runners); fallback al tarball oficial.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg-src.tar \
+            "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n${FF_SRC_VERSION}.tar.gz" || \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg-src.tar \
+            "https://ffmpeg.org/releases/ffmpeg-${FF_SRC_VERSION}.tar.xz"
+          mkdir -p /tmp/ffmpeg-src
+          tar -xf /tmp/ffmpeg-src.tar -C /tmp/ffmpeg-src --strip-components=1
+          cd /tmp/ffmpeg-src
+          # Config mínima para rtv: solo DECODE. Sin avfilter/avdevice ni
+          # encoders/muxers. dav1d = AV1 decente; vaapi = hwdec (enlazado
+          # dinámico normal, SIN los stubs dlopen+assert de BtbN).
+          # --disable-xlib/libxcb: VAAPI solo por DRM render nodes (el camino
+          # moderno) -> no se arrastra libX11 y familia al paquete.
+          # Verificado en local: configure OK con CONFIG_VAAPI=1 y
+          # CONFIG_LIBDAV1D=1, licencia "LGPL version 2.1 or later".
+          ./configure --prefix="$HOME/ffmpeg" \
+            --enable-shared --disable-static \
+            --disable-programs --disable-doc \
+            --disable-avdevice --disable-avfilter \
+            --disable-encoders --disable-muxers \
+            --disable-xlib --disable-libxcb \
+            --enable-libdav1d --enable-vaapi
+          make -j"$(nproc)"
+          make install
+          cp COPYING.LGPLv2.1 "$HOME/ffmpeg/LICENSE.txt"
 
       - name: Compilar
-        run: cargo build --release --locked
+        run: |
+          echo "FFMPEG_DIR=$HOME/ffmpeg" >> "$GITHUB_ENV"
+          export FFMPEG_DIR="$HOME/ffmpeg"
+          cargo build --release --locked
 
       - name: Tests unitarios
         env:
           LD_LIBRARY_PATH: ${{ env.FFMPEG_DIR }}/lib
         run: cargo test --release --locked
 
-      - name: Empaquetar (binario + libs FFmpeg, RPATH $ORIGIN/lib)
+      - name: Empaquetar (binario + cierre de libs no-sistema, RPATH $ORIGIN)
         id: pkg
         run: |
           set -euo pipefail
@@ -91,17 +131,23 @@ jobs:
           pkg="rtv-${ver}-linux-${{ matrix.arch }}"
           mkdir -p "dist/$pkg/lib"
           cp target/release/rtv "dist/$pkg/"
-          # Copiar EXACTAMENTE las libs FFmpeg que el binario declara (NEEDED).
-          # El set {avutil,avcodec,avformat,swscale,swresample} es cerrado:
-          # no dependen de ninguna otra lib de FFmpeg entre ellas.
-          libs=$(readelf -d target/release/rtv | sed -n 's/.*NEEDED.*\[\(lib\(av\|sw\)[^]]*\)\].*/\1/p')
+          # Cierre transitivo de dependencias NO-sistema (ffmpeg + dav1d +
+          # libva...): todo lo que ldd resuelva salvo la familia glibc,
+          # libgcc y libasound (ésa es del sistema por diseño: sus plugins
+          # ALSA no son empaquetables).
+          sysre='linux-vdso|ld-linux|libc\.so|libm\.so|libdl\.so|libpthread\.so|librt\.so|libgcc_s|libmvec|libasound'
           count=0
-          for lib in $libs; do
-            cp -L "$FFMPEG_DIR/lib/$lib" "dist/$pkg/lib/"
+          while read -r name path; do
+            [[ "$name" =~ $sysre ]] && continue
+            cp -L "$path" "dist/$pkg/lib/"
             count=$((count+1))
-          done
-          test "$count" -eq 5   # sanity: avutil avcodec avformat swscale swresample
+          done < <(LD_LIBRARY_PATH="$FFMPEG_DIR/lib" ldd target/release/rtv | awk '/=>/ {print $1, $3}')
+          echo "libs empaquetadas: $count"; ls "dist/$pkg/lib/"
+          test "$count" -ge 5   # sanity: al menos las 5 de ffmpeg
+          # RPATH: $ORIGIN/lib en el binario; $ORIGIN en cada lib para que
+          # resuelvan a sus hermanas del mismo dir (p.ej. avutil -> libva).
           patchelf --set-rpath '$ORIGIN/lib' "dist/$pkg/rtv"
+          for so in "dist/$pkg/lib/"*; do patchelf --set-rpath '$ORIGIN' "$so"; done
           cp "$FFMPEG_DIR/LICENSE.txt" "dist/$pkg/LICENSE-ffmpeg.txt"
           cp README.md "dist/$pkg/"
           tar -C dist -czf "$pkg.tar.gz" "$pkg"
@@ -118,10 +164,9 @@ jobs:
           ! grep -q "not found" /tmp/ldd.txt
           grep -E "libav|libsw" /tmp/ldd.txt | grep -qv "/tmp/smoke-pkg/lib" && exit 1 || true
           /tmp/smoke-pkg/rtv --version
-          # Reproducción real hasta EOF en un pty (el ffmpeg CLI de BtbN genera
-          # el vídeo; su RPATH viene roto, de ahí el LD_LIBRARY_PATH puntual).
-          LD_LIBRARY_PATH="$FFMPEG_DIR/lib" "$FFMPEG_DIR/bin/ffmpeg" -y \
-            -f lavfi -i testsrc2=size=320x180:rate=30 -t 2 -c:v mpeg4 -an /tmp/smoke.mp4
+          # Vídeo de prueba con el ffmpeg CLI de apt (solo fixture de test).
+          ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 2 \
+            -c:v mpeg4 -an /tmp/smoke.mp4
           # Harness pty propio (winsize fijo + drenaje continuo + volcado de
           # diagnóstico si falla): el `script` de util-linux 2.37 del runner
           # maneja mal el stdin no-TTY y el hijo moría con SIGABRT (exit 134).
@@ -344,8 +389,8 @@ jobs:
 
             | Plataforma | Fichero | Requisitos |
             |---|---|---|
-            | Linux x86_64 | `rtv-*-linux-x86_64.tar.gz` | glibc ≥ 2.28, libasound2 |
-            | Linux arm64 | `rtv-*-linux-arm64.tar.gz` | glibc ≥ 2.28, libasound2 |
+            | Linux x86_64 | `rtv-*-linux-x86_64.tar.gz` | glibc ≥ 2.35 (Ubuntu 22.04+), libasound2 |
+            | Linux arm64 | `rtv-*-linux-arm64.tar.gz` | glibc ≥ 2.35 (Ubuntu 22.04+), libasound2 |
             | Windows x86_64 | `rtv-*-windows-x86_64.zip` | Windows 10+ |
             | macOS Intel | `rtv-*-macos-x86_64.tar.gz` | macOS 13+ |
             | macOS Apple Silicon | `rtv-*-macos-arm64.tar.gz` | macOS 14+ |
