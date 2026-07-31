@@ -68,7 +68,7 @@ jobs:
           # (personality — ver README de termux-docker).
           docker run -d --name tx --security-opt seccomp=unconfined \
             termux/termux-docker:${{ matrix.arch }} sleep infinity
-          docker exec tx uname -m
+          docker exec -u 1000 tx uname -m
 
       - name: Copiar repo (+ caché FFmpeg) al contenedor
         run: |
@@ -81,7 +81,7 @@ jobs:
 
       - name: Build nativo (scripts/build-termux.sh — el MISMO del usuario)
         run: |
-          docker exec -e HOME=$TXH -w $TXH/rtv tx \
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx \
             bash scripts/build-termux.sh
 
       - name: Exportar FFmpeg al caché
@@ -95,16 +95,16 @@ jobs:
           # ffmpeg de los repos Termux (8.x): SOLO como fixture de test.
           # No interfiere con el 7.1 empaquetado (sonames distintos y el
           # wrapper rtv antepone su propio LD_LIBRARY_PATH).
-          docker exec -e HOME=$TXH tx pkg install -y python ffmpeg pulseaudio
+          docker exec -u 1000 -e HOME=$TXH tx pkg install -y python ffmpeg pulseaudio
           # Vídeo sin audio (smoke) y con audio (test del backend pulse).
-          docker exec -e HOME=$TXH tx sh -c \
+          docker exec -u 1000 -e HOME=$TXH tx sh -c \
             'ffmpeg -y -loglevel error -f lavfi -i testsrc2=size=320x180:rate=30 -t 2 -c:v mpeg4 -an $HOME/smoke.mp4'
-          docker exec -e HOME=$TXH tx sh -c \
+          docker exec -u 1000 -e HOME=$TXH tx sh -c \
             'ffmpeg -y -loglevel error -f lavfi -i testsrc2=size=320x180:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 6 -c:v mpeg4 -c:a aac -shortest $HOME/smoke_audio.mp4'
 
       - name: Smoke test (pty real, --no-audio)
         run: |
-          docker exec -e HOME=$TXH -w $TXH/rtv tx \
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx \
             python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke.mp4
 
       - name: Test de AUDIO real (PulseAudio null-sink, backend pulse)
@@ -116,28 +116,28 @@ jobs:
           # Protocolo TCP loopback (receta estándar de Termux): el socket
           # unix por defecto vive en un runtime-dir por-sesión que NO se
           # comparte de forma fiable entre distintos `docker exec`.
-          docker exec -e HOME=$TXH tx sh -c \
+          docker exec -u 1000 -e HOME=$TXH tx sh -c \
             'pulseaudio --start --exit-idle-time=-1 --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" \
              && PULSE_SERVER=127.0.0.1 pactl load-module module-null-sink sink_name=ci_sink \
              && PULSE_SERVER=127.0.0.1 pactl info | head -3'
           # Backend explícito pulse: exige >=20 writes del feeder, reloj
           # de audio llegando a >=1 s y monotonía >=95% (audio REAL
           # anclando el master clock, no solo "no crashea").
-          docker exec -e HOME=$TXH -e PULSE_SERVER=127.0.0.1 -w $TXH/rtv tx \
+          docker exec -u 1000 -e HOME=$TXH -e PULSE_SERVER=127.0.0.1 -w $TXH/rtv tx \
             python3 ci/termux_audio_check.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke_audio.mp4 --audio-backend pulse
           # `auto` DENTRO de Termux debe elegir pulse él solo (la
           # detección va por TERMUX_VERSION/PREFIX).
-          docker exec -e HOME=$TXH -e PULSE_SERVER=127.0.0.1 -e TERMUX_VERSION=docker -w $TXH/rtv tx \
+          docker exec -u 1000 -e HOME=$TXH -e PULSE_SERVER=127.0.0.1 -e TERMUX_VERSION=docker -w $TXH/rtv tx \
             python3 ci/termux_audio_check.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke_audio.mp4
 
       - name: CLI --audio-backend (none + valor inválido)
         run: |
           # none: reproduce sin audio y sale limpio.
-          docker exec -e HOME=$TXH -w $TXH/rtv tx sh -c \
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx sh -c \
             'python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv $HOME/smoke.mp4 --audio-backend none'
           # inválido: exit 2 con mensaje visible.
           set +e
-          docker exec -e HOME=$TXH tx rtv --audio-backend patata $TXH/smoke.mp4
+          docker exec -u 1000 -e HOME=$TXH tx rtv --audio-backend patata $TXH/smoke.mp4
           code=$?
           set -e
           if [ "$code" != "2" ]; then
