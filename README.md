@@ -175,11 +175,12 @@ El backend de terminal recomendado en Termux es el que auto-detecta rtv
 (tap en la barra de progreso) funcionan si el terminal reporta eventos
 de ratón.
 
-Todo esto se valida en CI sin dispositivo físico con el workflow
-[`termux.yml`](.github/workflows/termux.yml), que compila y testea rtv
-(incluido el camino real de audio por PulseAudio) dentro de imágenes
-[`termux/termux-docker`](https://github.com/termux/termux-docker) para
-x86_64 y aarch64, y publica paquetes `rtv-*-termux-*` como artefactos.
+Todo esto se valida en CI sin dispositivo físico dentro del workflow
+[`build.yml`](.github/workflows/build.yml) (jobs `termux-*`), que compila
+y testea rtv (incluido el camino real de audio por PulseAudio) dentro de
+imágenes [`termux/termux-docker`](https://github.com/termux/termux-docker)
+para x86_64 y aarch64, y publica paquetes `rtv-*-termux-*` como artefactos
+(y en las releases, junto al resto de plataformas).
 
 ## Uso
 
