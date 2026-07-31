@@ -84,9 +84,28 @@ máquina y el terminal, pero los órdenes de magnitud se mantienen.
 
 ## Instalación
 
+### Binarios precompilados (recomendado)
+
+Cada [release](../../releases) incluye paquetes **autocontenidos** para
+Windows (x86_64), Linux (x86_64/arm64) y macOS (Intel/Apple Silicon) con
+**FFmpeg 7.1 empaquetado dentro** — no hace falta instalar FFmpeg ni nada más:
+
+```bash
+tar -xzf rtv-*-linux-x86_64.tar.gz && cd rtv-*/ && ./rtv vídeo.mp4
+```
+
+En Windows: descomprime el `.zip` y ejecuta `rtv.exe vídeo.mp4` (las DLLs de
+FFmpeg van junto al exe). El binario debe quedarse junto a su carpeta
+`lib/`/`libs/` (Linux/macOS) o junto a las DLLs (Windows). Los paquetes se
+generan en CI ([`ci/build.yml`](ci/build.yml) — se activa con
+`bash ci/activar-workflow.sh`, ver ese script); también puedes bajar los
+artefactos de cualquier ejecución del workflow.
+
+### Compilar desde fuente
+
 Necesitas Rust (edition 2021) y las librerías de desarrollo de FFmpeg.
 
-### Linux (Debian/Ubuntu)
+#### Linux (Debian/Ubuntu)
 
 ```bash
 sudo apt install libavformat-dev libavcodec-dev libavutil-dev \
@@ -95,14 +114,17 @@ sudo apt install libavformat-dev libavcodec-dev libavutil-dev \
 cargo build --release
 ```
 
-### macOS
+#### macOS
 
 ```bash
-brew install ffmpeg pkg-config
+# OJO: ffmpeg@7, no ffmpeg — brew ya sirve FFmpeg 8.x, que NO compila con
+# ffmpeg-the-third 5.0 (misma razón que en BUILD-WINDOWS.md).
+brew install ffmpeg@7 pkg-config
+export FFMPEG_DIR="$(brew --prefix ffmpeg@7)"   # ffmpeg@7 es keg-only
 cargo build --release
 ```
 
-### Windows
+#### Windows
 
 Guía completa en [`BUILD-WINDOWS.md`](BUILD-WINDOWS.md). En corto:
 

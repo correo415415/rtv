@@ -404,3 +404,55 @@ Riesgos conocidos:
     [x] README: tabla de opciones (--aid/--alang/--sid/--slang), tabla
         de teclas (a/#/A, j/J), sección "Cambio de pista en runtime",
         tracks.rs y el test nuevo en la estructura.
+
+---
+
+# Tarea pendiente (APARCADA por decisión del usuario): soporte Termux (Android)
+
+Análisis de viabilidad hecho (sesión 2026-07-31); implementación NO empezada.
+
+## Conclusiones del análisis
+
+    VIABLE con trabajo moderado. Termux es un entorno Linux userland sobre
+    Android (bionic libc, prefix /data/data/com.termux/files/usr).
+
+    Lo que ya funcionaría tal cual:
+      * FFmpeg: Termux empaqueta `ffmpeg` (con libs y headers vía paquete
+        separado) — pkg-config lo encuentra. OJO: la versión de los repos de
+        Termux es rolling (hoy 7.x/8.x); si sube a 8.x, ffmpeg-the-third 5.0
+        no compila (mismos motivos que BUILD-WINDOWS.md) → habría que fijar
+        una versión o compilar FFmpeg 7.1 a mano.
+      * crossterm: Termux es un terminal xterm-like real con soporte de
+        ratón SGR, truecolor y resize → render blocks/ascii y toda la UI
+        funcionan. Sixel/kitty/iterm2 no (Termux no los soporta), la
+        autodetección ya cae a halfblocks.
+      * mimalloc, crossbeam, parking_lot: compilan en aarch64-linux-android.
+
+    Los DOS bloqueos reales:
+      1. cpal 0.15 en Android usa el backend AAudio vía NDK — pensado para
+         apps con Activity, NO para procesos de consola Termux. En la
+         práctica cpal no encuentra dispositivo → rtv ya degrada limpio a
+         `no_audio` (mismo camino que el sandbox de CI), o sea: VÍDEO OK,
+         AUDIO NO de serie.
+      2. Audio real en Termux pasa por PulseAudio (paquete `pulseaudio` +
+         `termux-api`): habría que añadir un backend de salida PulseAudio
+         (crate `libpulse-binding` o `psimple`) detrás de una feature flag
+         (p.ej. `--features pulse`), seleccionable en runtime si
+         PULSE_SERVER está definido.
+
+## Plan propuesto (cuando se retome)
+
+    [ ] Fase 1 — build + doc (sin código nuevo):
+        * Compilar EN Termux nativo (rustc de Termux, no cross): pkg install
+          rust clang pkg-config ffmpeg + cargo build --release.
+        * Verificar reproducción --no-audio en el terminal de Termux.
+        * Documentar en README sección "Termux" (incl. advertencia de la
+          versión de FFmpeg de los repos).
+    [ ] Fase 2 — audio:
+        * Feature `pulse`: backend de salida PulseAudio simple-API detrás
+          del mismo trait/canal que usa cpal (el reloj maestro no cambia:
+          sigue siendo el PTS efectivo escrito por el callback/writer).
+        * Guía: pulseaudio en Termux (`pulseaudio --start` +
+          PULSE_SERVER=127.0.0.1 o unix socket).
+    [ ] Fase 3 (opcional) — CI: job aarch64-linux-android de compile-check
+        (cross con NDK solo para detectar breakage, sin empaquetado).
