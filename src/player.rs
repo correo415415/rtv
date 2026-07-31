@@ -19,7 +19,9 @@
 
 use anyhow::Result;
 use crossterm::{
-    cursor, execute,
+    cursor,
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::io::{stdout, Stdout, Write};
@@ -118,7 +120,10 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter(so: &mut Stdout) -> Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(so, EnterAlternateScreen, cursor::Hide)?;
+        // Captura de ratón: para la barra de progreso clicable. Si el
+        // terminal no la soporta, crossterm emite las secuencias
+        // igualmente y el terminal las ignora — sin daño.
+        execute!(so, EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
         // AUTOWRAP OFF (DECAWM): escribir en la última columna de la
         // última fila con wrap activo hace scroll de TODA la pantalla
         // → el vídeo sube una línea, el siguiente frame lo repinta…
@@ -138,7 +143,7 @@ impl Drop for TerminalGuard {
         let mut so = stdout();
         // Restaurar autowrap y salir del alt-screen.
         let _ = write!(so, "\x1b[?7h");
-        let _ = execute!(so, cursor::Show, LeaveAlternateScreen);
+        let _ = execute!(so, DisableMouseCapture, cursor::Show, LeaveAlternateScreen);
         let _ = write!(so, "\x1b[0m");
         let _ = so.flush();
         let _ = terminal::disable_raw_mode();
@@ -149,6 +154,39 @@ impl Drop for TerminalGuard {
 /// Si el contenido no cambia, NO se reescribe la fila → el HUD pasa
 /// de reescribirse 25-60 veces/s a ~1 vez/s — adiós parpadeo.
 type HudCache = Option<(u16, u16, u16, String, String)>;
+
+/// Ancho de la barra de progreso del HUD según columnas. Única fuente
+/// de verdad: la usan `format_hud_lines` (dibujo) y `bar_hitbox`
+/// (clicks del ratón) — si divergen, el click aterriza en el sitio
+/// equivocado.
+fn hud_bar_w(cols: u16) -> usize {
+    if cols >= 120 {
+        40
+    } else if cols >= 80 {
+        24
+    } else if cols >= 60 {
+        16
+    } else {
+        8
+    }
+}
+
+/// Hitbox de la barra de progreso en pantalla: `(fila, col_inicio,
+/// ancho)` en coordenadas 1-based, o None si el HUD actual no pinta
+/// barra (HUD oculto, o línea corta de <60 cols que omite la barra).
+///
+/// La línea del HUD con barra siempre empieza " ▶ [" / " ⏸ [": espacio
+/// (1) + flag (1) + espacio (1) + '[' (1) → la barra ocupa las
+/// columnas 5..5+bar_w-1. Con HUD de 2 líneas la barra va en la
+/// PENÚLTIMA fila; con 1 línea, en la última.
+fn bar_hitbox(cols: u16, rows: u16, hud_lines: u16) -> Option<(u16, u16, u16)> {
+    let bar_w = hud_bar_w(cols) as u16;
+    match hud_lines {
+        2 => Some((rows.saturating_sub(1).max(1), 5, bar_w)),
+        1 if cols >= 60 => Some((rows, 5, bar_w)),
+        _ => None,
+    }
+}
 
 fn hud_rows_for(cols: u16, rows: u16) -> u16 {
     // Terminal minúscula: NO hay sitio para un HUD legible — pintarlo
@@ -438,23 +476,52 @@ pub fn run(cfg: Config) -> Result<()> {
                         }
                     }
                 }
-                Cmd::SeekRel(delta) => {
+                Cmd::SeekRel(..) | Cmd::MouseClick(..) => {
                     let now = master.now();
+                    // Clamp: dejamos 0.5 s de margen antes del final para
+                    // no aterrizar en EOF exacto (pantalla congelada).
+                    let max_t = (dec.duration - 0.5).max(0.0);
+                    let target = match cmd {
+                        Cmd::SeekRel(delta) => (now + delta).max(0.0).min(max_t),
+                        Cmd::MouseClick(mc, mr) => {
+                            // Solo actúa si el click cae en la BARRA de
+                            // progreso del HUD (con 1 celda de gracia a
+                            // cada lado: los corchetes '[' ']'). El resto
+                            // de la pantalla ignora el ratón.
+                            let Some((brow, bcol, bw)) = bar_hitbox(cols, rows, hud_lines)
+                            else {
+                                continue;
+                            };
+                            if mr != brow || mc + 1 < bcol || mc > bcol + bw {
+                                continue;
+                            }
+                            if !(dec.duration.is_finite() && dec.duration > 0.0) {
+                                continue;
+                            }
+                            // Posición proporcional dentro de la barra:
+                            // celda i de [0, bw) → fracción i/(bw-1)
+                            // (la última celda aterriza en el final).
+                            let i = mc.saturating_sub(bcol).min(bw.saturating_sub(1));
+                            let frac = if bw > 1 {
+                                f64::from(i) / f64::from(bw - 1)
+                            } else {
+                                0.0
+                            };
+                            (frac * dec.duration).max(0.0).min(max_t)
+                        }
+                        _ => unreachable!(),
+                    };
                     if let Some(log) = sync_log.as_mut() {
                         let _ = writeln!(
                             log,
-                            "# SEEK wall={:.4} delta={:+.1} now={:.3} anchored={}",
+                            "# SEEK wall={:.4} target={:.3} now={:.3} anchored={}",
                             wall_now_f64(),
-                            delta,
+                            target,
                             now,
                             master.master_anchored(),
                         );
                         let _ = log.flush();
                     }
-                    // Clamp: dejamos 0.5 s de margen antes del final para
-                    // no aterrizar en EOF exacto (pantalla congelada).
-                    let max_t = (dec.duration - 0.5).max(0.0);
-                    let target = (now + delta).max(0.0).min(max_t);
                     // ORDEN ATÓMICO:
                     //   (1) master.set(target) → bumpea serial en audclk
                     //       Y vidclk; cualquier chunk/frame en vuelo con
@@ -469,8 +536,9 @@ pub fn run(cfg: Config) -> Result<()> {
                     // GOP sea más largo que el paso del seek — AV1 de
                     // YouTube tiene GOPs de >6 s y con keyframe<=target
                     // el vídeo se quedaba clavado); hacia ATRÁS en el
-                    // keyframe <= target, como siempre.
-                    dec.seek_dir(target, delta > 0.0);
+                    // keyframe <= target, como siempre. Con el ratón
+                    // la dirección es relativa a la posición actual.
+                    dec.seek_dir(target, target > now);
                     // Descartar el frame en vuelo: su serial ya es viejo.
                     pending = None;
                     // Un seek real drena la cola y re-decodifica con
@@ -1495,15 +1563,7 @@ fn format_hud_lines(
     let t = clock.now().max(0.0).min(duration.max(0.0));
     let flag = if paused { "⏸" } else { "▶" };
 
-    let bar_w = if cols >= 120 {
-        40
-    } else if cols >= 80 {
-        24
-    } else if cols >= 60 {
-        16
-    } else {
-        8
-    };
+    let bar_w = hud_bar_w(cols);
     let filled = if duration > 0.0 {
         ((t / duration) * bar_w as f64).round() as usize
     } else {
@@ -1546,7 +1606,8 @@ fn format_hud_lines(
             line1.push_str(&stats_block());
         }
         let line2 =
-            " q=salir · ␣=pausa · ←/→=seek ±5s · ↑/↓=vol ±5 · a=pista audio · j=subs".to_string();
+            " q=salir · ␣=pausa · ←/→=seek ±5s · click barra=ir a · ↑/↓=vol ±5 · a=audio · j=subs"
+                .to_string();
         (line1, line2)
     } else if cols >= 60 {
         let mut line = format!(

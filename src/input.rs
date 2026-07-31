@@ -1,9 +1,11 @@
-//! Manejo de entrada de teclado (no bloqueante) usando crossterm.
+//! Manejo de entrada de teclado y ratón (no bloqueante) usando crossterm.
 //!
 //! Sondeamos con `event::poll(Duration::ZERO)` desde el loop principal
 //! para no meter overhead de threads adicionales.
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
@@ -18,6 +20,11 @@ pub enum Cmd {
     /// Ciclar pista de SUBTÍTULOS (+1 = siguiente, -1 = anterior;
     /// el ciclo incluye "off" y la pista externa de --sub si la hay).
     CycleSubs(i32),
+    /// Click/arrastre IZQUIERDO del ratón en (col, row), 1-based (la
+    /// celda superior izquierda es (1,1), como las secuencias CSI).
+    /// El player lo traduce: si cae sobre la barra de progreso del
+    /// HUD → seek proporcional; en cualquier otro sitio se ignora.
+    MouseClick(u16, u16),
     None,
 }
 
@@ -62,6 +69,24 @@ pub fn poll_command() -> std::io::Result<Vec<Cmd>> {
                 // Coalescencia: sustituir cualquier Resize previo.
                 out.retain(|c| !matches!(c, Cmd::Resize(..)));
                 out.push(Cmd::Resize(c, r));
+            }
+            Event::Mouse(m) => {
+                // Down = click; Drag = scrubbing (arrastrar sobre la
+                // barra reposiciona en continuo). Se COALESCEN igual
+                // que los resizes: un arrastre genera decenas de
+                // eventos por frame y solo importa el último — sin
+                // esto cada evento disparaba un seek completo (drenar
+                // cola + re-decode) y la ráfaga saturaba el decoder.
+                if matches!(
+                    m.kind,
+                    MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Drag(MouseButton::Left)
+                ) {
+                    out.retain(|c| !matches!(c, Cmd::MouseClick(..)));
+                    // crossterm reporta 0-based; el player trabaja en
+                    // coordenadas de pantalla 1-based.
+                    out.push(Cmd::MouseClick(m.column + 1, m.row + 1));
+                }
             }
             _ => {}
         }

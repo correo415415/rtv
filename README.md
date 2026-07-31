@@ -177,6 +177,7 @@ H.264 en la misma máquina vaya por GPU.
 | `a` / `#` (`A` = atrás) | Cicla la pista de AUDIO en caliente, sin cortar el playback (el HUD muestra la pista con un OSD de ~2.5 s) |
 | `j` (`J` = atrás) | Cicla subtítulos: off → [externa `--sub`] → pistas embebidas → off |
 | `q` / `Esc` / `Ctrl+C` | Salir |
+| 🖱️ Click / arrastre en la barra del HUD | Salta a esa posición del vídeo (seek proporcional; arrastrar hace scrubbing) |
 
 #### Cambio de pista en runtime
 
