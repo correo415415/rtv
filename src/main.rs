@@ -12,6 +12,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 mod audio;
+mod audio_backend;
 mod clock;
 mod decoder;
 mod hwdec;
@@ -51,6 +52,11 @@ struct Cli {
     /// Desactivar audio (usa reloj monotónico)
     #[arg(long)]
     no_audio: bool,
+
+    /// Backend de salida de audio: auto | cpal | pulse | none.
+    /// `auto` elige según plataforma (en Termux prueba pulse primero).
+    #[arg(long, default_value = "auto")]
+    audio_backend: String,
 
     /// Subtítulos. SIN esta opción no se muestran subtítulos.
     /// `--sub` (sin valor) usa la pista de texto embebida del
@@ -105,6 +111,14 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    // Ídem --audio-backend.
+    let audio_backend = match audio::BackendPref::parse(&cli.audio_backend) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
 
     // Silenciar libav antes de tocar nada. Ver comentarios largos en el
     // repositorio para el razonamiento (tres capas de log).
@@ -153,6 +167,7 @@ fn main() -> Result<()> {
         loop_video: cli.loop_video,
         show_stats: cli.stats,
         no_audio: cli.no_audio,
+        audio_backend,
         hw_pref,
         sub_mode,
         aid: cli.aid,

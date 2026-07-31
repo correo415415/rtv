@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Smoke test de CI: reproduce un vídeo COMPLETO en un pty real y exige exit 0.
 
-Uso: smoke_pty.py <ruta-a-rtv> <ruta-a-video>
+Uso: smoke_pty.py <ruta-a-rtv> <ruta-a-video> [args-extra-de-rtv...]
+
+Los args extra se insertan tal cual (p.ej. --audio-backend none).
 
 Sustituye a `script -qec` (el `script` de util-linux 2.37 de ubuntu-22.04
 maneja mal el stdin no-TTY de los runners y el hijo moría con SIGABRT).
@@ -39,7 +41,8 @@ def main() -> int:
     if pid == 0:  # hijo
         os.environ.setdefault("TERM", "xterm-256color")
         # --verbose: NO silenciar stderr -> un panic de Rust queda en el log.
-        os.execvp(rtv, [rtv, "--verbose", "--no-audio", "--backend", "ascii", video])
+        extra = sys.argv[3:]
+        os.execvp(rtv, [rtv, "--verbose", "--no-audio", "--backend", "ascii", *extra, video])
 
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     os.kill(pid, signal.SIGWINCH)

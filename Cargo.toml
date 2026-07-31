@@ -19,8 +19,16 @@ ffmpeg-the-third = { version = "5.0", default-features = false, features = [
 crossterm = { version = "0.29", features = ["event-stream"] }
 
 # --- Audio ---
-# cpal: acceso cross-platform a WASAPI (Win), ALSA/PulseAudio (Linux), CoreAudio (Mac).
-cpal = "0.15"
+# cpal: acceso cross-platform a WASAPI (Win), ALSA/PulseAudio (Linux),
+# CoreAudio (Mac). OPCIONAL: en Termux/Android no compila (su backend
+# AAudio/oboe requiere el NDK y un contexto de app) — allí se usa el
+# backend `pulse` (ver abajo).
+cpal = { version = "0.15", optional = true }
+
+# libloading: dlopen de libpulse-simple en runtime para el backend
+# PulseAudio (Termux y fallback en Linux). Sin dependencia de build
+# contra libpulse: si la lib no está en el sistema se degrada limpio.
+libloading = { version = "0.8", optional = true }
 
 # --- Concurrencia ---
 crossbeam-channel = "0.5"
@@ -38,6 +46,14 @@ unicode-width = "0.2"
 
 # --- Allocator rápido ---
 mimalloc = { version = "0.1", default-features = false }
+
+[features]
+# Ambos backends de audio por defecto: cpal (WASAPI/ALSA/CoreAudio) y
+# pulse (PulseAudio vía dlopen — coste cero si no hay servidor).
+# Termux/Android: compilar con `--no-default-features --features pulse`.
+default = ["cpal-audio", "pulse"]
+cpal-audio = ["dep:cpal"]
+pulse = ["dep:libloading"]
 
 [profile.release]
 opt-level = 3
