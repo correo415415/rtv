@@ -1,0 +1,339 @@
+# Compila rtv para Windows, Linux y macOS con FFmpeg 7.1 EMPAQUETADO dentro
+# de cada artefacto: el usuario final NO necesita instalar FFmpeg.
+#
+# Por qué FFmpeg 7.1 exactamente: ffmpeg-the-third 5.0 usa AVCodecID V410/V308
+# (solo existen desde 7.1) y campos legacy de AVCodec eliminados en 8.0
+# (ver BUILD-WINDOWS.md). 7.1.x es la única rama que compila.
+#
+# Estrategia por SO (todo validado):
+#   * Linux (x86_64 + arm64): builds oficiales BtbN "lgpl-shared" (los mismos
+#     que recomienda BUILD-WINDOWS.md para Windows). Se compila con FFMPEG_DIR
+#     (soportado por el build.rs de ffmpeg-sys-the-third) y se empaquetan las
+#     5 .so junto al binario con RPATH=$ORIGIN/lib (patchelf). Las libs BtbN
+#     solo exigen glibc>=2.28 y el binario libasound2 (presente en cualquier
+#     Linux de escritorio): el paquete funciona desde cualquier ruta.
+#   * Windows (x86_64): BtbN "win64-lgpl-shared" (equivalente al winget
+#     BtbN.FFmpeg.*.Shared.7.1 que usa BUILD-WINDOWS.md). FFMPEG_DIR + las
+#     5 DLLs copiadas junto a rtv.exe (Windows resuelve DLLs del dir del exe).
+#   * macOS (x86_64 + arm64): no hay BtbN para macOS -> se compila FFmpeg
+#     7.1.5 desde fuente (config mínima LGPL: solo decode, sin
+#     avfilter/avdevice/encoders, + dav1d para AV1 y VideoToolbox para hwdec),
+#     se cachea, y se empaquetan las dylibs con dylibbundler
+#     (@executable_path/libs) + re-firma ad-hoc (obligatoria en arm64).
+#     Runners: macos-15-intel (macos-13 fue retirado en dic 2025) y macos-14.
+
+name: build
+
+# Nota: sin filtro `paths` a propósito — GitHub también lo evalúa en pushes
+# de tags y podría saltarse una release si el commit etiquetado no tocó src/.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Rama de BtbN/FFmpeg-Builds (release "latest", assets ffmpeg-n7.1-latest-*).
+  FF_BRANCH: "7.1"
+  # Tarball fuente para macOS (último 7.1.x publicado en ffmpeg.org).
+  FF_SRC_VERSION: "7.1.5"
+
+jobs:
+  # ---------------------------------------------------------------- Linux --
+  linux:
+    name: linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04       # glibc 2.35 -> compatible hacia delante
+            arch: x86_64
+            btbn: linux64
+          - runner: ubuntu-22.04-arm   # runners ARM gratis en repos públicos
+            arch: arm64
+            btbn: linuxarm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev pkg-config patchelf clang libclang-dev
+
+      - name: Descargar FFmpeg ${{ env.FF_BRANCH }} shared (BtbN)
+        run: |
+          url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n${FF_BRANCH}-latest-${{ matrix.btbn }}-lgpl-shared-${FF_BRANCH}.tar.xz"
+          curl -fsSL --retry 3 -o /tmp/ffmpeg.tar.xz "$url"
+          mkdir -p "$HOME/ffmpeg"
+          tar -xf /tmp/ffmpeg.tar.xz -C "$HOME/ffmpeg" --strip-components=1
+          echo "FFMPEG_DIR=$HOME/ffmpeg" >> "$GITHUB_ENV"
+
+      - name: Compilar
+        run: cargo build --release --locked
+
+      - name: Tests unitarios
+        env:
+          LD_LIBRARY_PATH: ${{ env.FFMPEG_DIR }}/lib
+        run: cargo test --release --locked
+
+      - name: Empaquetar (binario + libs FFmpeg, RPATH $ORIGIN/lib)
+        id: pkg
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then ver="$GITHUB_REF_NAME"; else ver="${GITHUB_SHA::7}"; fi
+          pkg="rtv-${ver}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$pkg/lib"
+          cp target/release/rtv "dist/$pkg/"
+          # Copiar EXACTAMENTE las libs FFmpeg que el binario declara (NEEDED).
+          # El set {avutil,avcodec,avformat,swscale,swresample} es cerrado:
+          # no dependen de ninguna otra lib de FFmpeg entre ellas.
+          libs=$(readelf -d target/release/rtv | sed -n 's/.*NEEDED.*\[\(lib\(av\|sw\)[^]]*\)\].*/\1/p')
+          count=0
+          for lib in $libs; do
+            cp -L "$FFMPEG_DIR/lib/$lib" "dist/$pkg/lib/"
+            count=$((count+1))
+          done
+          test "$count" -eq 5   # sanity: avutil avcodec avformat swscale swresample
+          patchelf --set-rpath '$ORIGIN/lib' "dist/$pkg/rtv"
+          cp "$FFMPEG_DIR/LICENSE.txt" "dist/$pkg/LICENSE-ffmpeg.txt"
+          cp README.md "dist/$pkg/"
+          tar -C dist -czf "$pkg.tar.gz" "$pkg"
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (paquete relocable, sin FFmpeg del sistema)
+        run: |
+          set -euo pipefail
+          pkg="${{ steps.pkg.outputs.pkg }}"
+          # Copiar el paquete a otra ruta para probar la relocabilidad real.
+          cp -r "dist/$pkg" /tmp/smoke-pkg
+          # Las libs deben resolverse DENTRO del paquete, nada "not found".
+          ldd /tmp/smoke-pkg/rtv | tee /tmp/ldd.txt
+          ! grep -q "not found" /tmp/ldd.txt
+          grep -E "libav|libsw" /tmp/ldd.txt | grep -qv "/tmp/smoke-pkg/lib" && exit 1 || true
+          /tmp/smoke-pkg/rtv --version
+          # Reproducción real hasta EOF en un pty (el ffmpeg CLI de BtbN genera
+          # el vídeo; su RPATH viene roto, de ahí el LD_LIBRARY_PATH puntual).
+          LD_LIBRARY_PATH="$FFMPEG_DIR/lib" "$FFMPEG_DIR/bin/ffmpeg" -y \
+            -f lavfi -i testsrc2=size=320x180:rate=30 -t 2 -c:v mpeg4 -an /tmp/smoke.mp4
+          cd /tmp
+          TERM=xterm-256color timeout 30 script -qec \
+            "/tmp/smoke-pkg/rtv --no-audio --backend ascii /tmp/smoke.mp4" /dev/null > /dev/null
+          echo "smoke OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- Windows --
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Descargar FFmpeg ${{ env.FF_BRANCH }} shared (BtbN)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n$env:FF_BRANCH-latest-win64-lgpl-shared-$env:FF_BRANCH.zip"
+          Invoke-WebRequest -Uri $url -OutFile C:\ffmpeg.zip
+          Expand-Archive C:\ffmpeg.zip -DestinationPath C:\ffdl
+          $inner = Get-ChildItem C:\ffdl -Directory | Select-Object -First 1
+          Move-Item $inner.FullName C:\ffmpeg
+          "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # bindgen necesita libclang; el runner trae LLVM preinstalado.
+          if (Test-Path "C:\Program Files\LLVM\bin") {
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Compilar
+        run: cargo build --release --locked
+
+      - name: Empaquetar (rtv.exe + DLLs de FFmpeg)
+        id: pkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_REF -like "refs/tags/*") { $ver = $env:GITHUB_REF_NAME } else { $ver = $env:GITHUB_SHA.Substring(0,7) }
+          $pkg = "rtv-$ver-windows-x86_64"
+          New-Item -ItemType Directory -Path "dist\$pkg" | Out-Null
+          Copy-Item target\release\rtv.exe "dist\$pkg\"
+          # Solo las 5 familias que rtv enlaza (sin avfilter/avdevice).
+          foreach ($fam in "avutil","avcodec","avformat","swscale","swresample") {
+            $dll = Get-ChildItem "C:\ffmpeg\bin\$fam-*.dll"
+            if (-not $dll) { throw "falta $fam-*.dll" }
+            Copy-Item $dll.FullName "dist\$pkg\"
+          }
+          Copy-Item C:\ffmpeg\LICENSE.txt "dist\$pkg\LICENSE-ffmpeg.txt"
+          Copy-Item README.md "dist\$pkg\"
+          Compress-Archive -Path "dist\$pkg" -DestinationPath "$pkg.zip"
+          "pkg=$pkg" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Smoke test (DLLs resueltas desde el dir del exe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pkg = "${{ steps.pkg.outputs.pkg }}"
+          # Copiar a otra ruta SIN C:\ffmpeg en el PATH: si --version arranca,
+          # el loader resolvió las DLLs desde el propio directorio del paquete.
+          Copy-Item -Recurse "dist\$pkg" "$env:TEMP\smoke-pkg"
+          $env:Path = ($env:Path -split ";" | Where-Object { $_ -notlike "*ffmpeg*" }) -join ";"
+          & "$env:TEMP\smoke-pkg\rtv.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "smoke test falló" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- macOS --
+  macos:
+    name: macos-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel   # último runner Intel disponible
+            arch: x86_64
+          - runner: macos-14         # Apple Silicon
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dependencias (brew)
+        run: brew install nasm dav1d dylibbundler pkgconf
+
+      - name: Cache de FFmpeg compilado
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg
+          key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-${{ matrix.runner }}-v1
+
+      - name: Compilar FFmpeg ${{ env.FF_SRC_VERSION }} desde fuente (LGPL mínimo)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/ffmpeg-src.tar.xz \
+            "https://ffmpeg.org/releases/ffmpeg-${FF_SRC_VERSION}.tar.xz"
+          mkdir -p /tmp/ffmpeg-src
+          tar -xf /tmp/ffmpeg-src.tar.xz -C /tmp/ffmpeg-src --strip-components=1
+          cd /tmp/ffmpeg-src
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          # Config mínima para rtv: solo DECODE. Sin avfilter/avdevice (la
+          # crate no los usa), sin encoders/muxers. dav1d = AV1 por software
+          # decente; VideoToolbox = hwdec (--hwdec auto de rtv).
+          ./configure --prefix="$HOME/ffmpeg" \
+            --enable-shared --disable-static \
+            --disable-programs --disable-doc \
+            --disable-avdevice --disable-avfilter \
+            --disable-encoders --disable-muxers \
+            --enable-libdav1d \
+            --enable-videotoolbox --enable-audiotoolbox
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          cp COPYING.LGPLv2.1 "$HOME/ffmpeg/LICENSE.txt"
+
+      - name: Compilar rtv
+        run: |
+          export FFMPEG_DIR="$HOME/ffmpeg"
+          cargo build --release --locked
+
+      - name: Empaquetar (dylibs con @executable_path + firma ad-hoc)
+        id: pkg
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then ver="$GITHUB_REF_NAME"; else ver="${GITHUB_SHA::7}"; fi
+          pkg="rtv-${ver}-macos-${{ matrix.arch }}"
+          mkdir -p "dist/$pkg/libs"
+          cp target/release/rtv "dist/$pkg/"
+          # dylibbundler copia las dylibs (ffmpeg + dav1d, recursivo), reescribe
+          # los install names a @executable_path/libs/ y arregla las refs entre
+          # dylibs. Las frameworks del sistema (VideoToolbox...) no se tocan.
+          dylibbundler -od -b \
+            -x "dist/$pkg/rtv" \
+            -d "dist/$pkg/libs" \
+            -p '@executable_path/libs/' \
+            -s "$HOME/ffmpeg/lib" \
+            -s "$(brew --prefix)/lib"
+          # Re-firmar (install_name_tool invalida la firma; en arm64 un binario
+          # sin firma válida ni siquiera arranca).
+          codesign --force --sign - "dist/$pkg/libs/"*.dylib "dist/$pkg/rtv"
+          # Verificación: ninguna referencia a rutas de build/homebrew.
+          otool -L "dist/$pkg/rtv" | tee /tmp/otool.txt
+          ! grep -Eq "$HOME/ffmpeg|/opt/homebrew|/usr/local/(opt|Cellar)" /tmp/otool.txt
+          for dylib in "dist/$pkg/libs/"*.dylib; do
+            otool -L "$dylib" | grep -Eq "$HOME/ffmpeg|/opt/homebrew|/usr/local/(opt|Cellar)" && exit 1 || true
+          done
+          cp "$HOME/ffmpeg/LICENSE.txt" "dist/$pkg/LICENSE-ffmpeg.txt"
+          cp README.md "dist/$pkg/"
+          tar -C dist -czf "$pkg.tar.gz" "$pkg"
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (paquete relocable)
+        run: |
+          set -euo pipefail
+          pkg="${{ steps.pkg.outputs.pkg }}"
+          cp -R "dist/$pkg" "$TMPDIR/smoke-pkg"
+          # En macOS las dylibs se cargan al arrancar el proceso: si --version
+          # funciona desde otra ruta, la relocación @executable_path es correcta.
+          "$TMPDIR/smoke-pkg/rtv" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- Release --
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Crear GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            Binarios autocontenidos: **FFmpeg 7.1 va incluido dentro de cada
+            paquete** — no hay que instalar nada más.
+
+            | Plataforma | Fichero | Requisitos |
+            |---|---|---|
+            | Linux x86_64 | `rtv-*-linux-x86_64.tar.gz` | glibc ≥ 2.28, libasound2 |
+            | Linux arm64 | `rtv-*-linux-arm64.tar.gz` | glibc ≥ 2.28, libasound2 |
+            | Windows x86_64 | `rtv-*-windows-x86_64.zip` | Windows 10+ |
+            | macOS Intel | `rtv-*-macos-x86_64.tar.gz` | macOS 13+ |
+            | macOS Apple Silicon | `rtv-*-macos-arm64.tar.gz` | macOS 14+ |
+
+            Uso: descomprimir y ejecutar `./rtv vídeo.mp4` (Windows: `rtv.exe vídeo.mp4`).
+            El binario debe permanecer junto a su carpeta `lib/`/`libs/` (Linux/macOS)
+            o junto a las DLLs (Windows).
