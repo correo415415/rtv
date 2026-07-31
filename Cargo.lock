@@ -914,6 +914,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "ffmpeg-the-third",
+ "libloading",
  "mimalloc",
  "once_cell",
  "parking_lot",

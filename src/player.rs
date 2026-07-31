@@ -60,6 +60,7 @@ pub struct Config {
     pub loop_video: bool,
     pub show_stats: bool,
     pub no_audio: bool,
+    pub audio_backend: audio::BackendPref,
     pub hw_pref: crate::hwdec::HwPref,
     /// Modo de subtítulos (ver `SubMode`).
     pub sub_mode: SubMode,
@@ -229,11 +230,22 @@ pub fn run(cfg: Config) -> Result<()> {
     // "best" de FFmpeg si no hay match.
     let start_audio_stream = tracks::select(&audio_tracks, cfg.aid, cfg.alang.as_deref())
         .map(|pos| audio_tracks[pos].stream_index);
-    let mut audio_handle: Option<AudioHandle> = if cfg.no_audio {
+    let mut audio_handle: Option<AudioHandle> = if cfg.no_audio
+        || cfg.audio_backend == audio::BackendPref::NoAudio
+    {
         None
     } else {
-        match audio::spawn(&cfg.path, audclk_pre.clone(), start_audio_stream) {
-            Ok(h) if h.has_audio => Some(h),
+        match audio::spawn(
+            &cfg.path,
+            audclk_pre.clone(),
+            start_audio_stream,
+            cfg.audio_backend,
+        ) {
+            Ok(h) if h.has_audio => {
+                // Visible solo con --verbose (stderr va a /dev/null si no).
+                eprintln!("[rtv-audio] backend de salida: {}", h.backend_name);
+                Some(h)
+            }
             _ => None,
         }
     };

@@ -137,6 +137,50 @@ Guía completa en [`BUILD-WINDOWS.md`](BUILD-WINDOWS.md). En corto:
 
 Windows Terminal soporta truecolor, half-blocks y WASAPI sin problemas.
 
+#### Termux (Android)
+
+rtv funciona de forma nativa en Termux (sin proot ni contenedores). El
+script [`scripts/build-termux.sh`](scripts/build-termux.sh) lo hace todo:
+
+```bash
+pkg install -y git
+git clone https://github.com/correo415415/rtv.git && cd rtv
+bash scripts/build-termux.sh
+rtv vídeo.mp4
+```
+
+Detalles que resuelve el script:
+
+- **FFmpeg**: los repos de Termux ya sirven FFmpeg 8.x, que **no compila**
+  con `ffmpeg-the-third 5.0`. El script compila FFmpeg **7.1.5** desde
+  fuente (solo decode, con dav1d) en `~/rtv-ffmpeg` — tarda un rato la
+  primera vez, pero queda cacheado para builds siguientes.
+- **Audio**: cpal (AAudio/oboe) no funciona en procesos de consola de
+  Termux, así que en Termux rtv usa un backend propio de **PulseAudio**
+  (carga `libpulse-simple` en runtime, sin dependencia de build). Para
+  tener sonido:
+
+  ```bash
+  pkg install -y pulseaudio
+  pulseaudio --start
+  ```
+
+  Sin servidor PulseAudio el vídeo se reproduce igualmente sin sonido
+  (mismo comportamiento que `--no-audio`).
+- **Instalación**: deja un wrapper `rtv` en `$PREFIX/bin` que exporta el
+  `LD_LIBRARY_PATH` del FFmpeg compilado.
+
+El backend de terminal recomendado en Termux es el que auto-detecta rtv
+(`blocks`/truecolor); con teclado táctil, los controles de ratón del HUD
+(tap en la barra de progreso) funcionan si el terminal reporta eventos
+de ratón.
+
+Todo esto se valida en CI sin dispositivo físico con el workflow
+[`termux.yml`](.github/workflows/termux.yml), que compila y testea rtv
+(incluido el camino real de audio por PulseAudio) dentro de imágenes
+[`termux/termux-docker`](https://github.com/termux/termux-docker) para
+x86_64 y aarch64, y publica paquetes `rtv-*-termux-*` como artefactos.
+
 ## Uso
 
 ```
@@ -150,6 +194,7 @@ rtv <fichero> [opciones]
 | `--loop-video` | Reinicia al llegar al final |
 | `--stats` | Telemetría en el HUD: backend, resolución, tamaño de celda, FPS mostrados/decodificados y drops (sin el flag el HUD es limpio: transporte + volumen) |
 | `--no-audio` | Sin audio; el vídeo usa reloj monotónico |
+| `--audio-backend <auto\|cpal\|pulse\|none>` | Backend de salida de audio. `auto` (default) usa cpal (ALSA/WASAPI/CoreAudio) y en Termux prueba primero PulseAudio; `pulse` fuerza PulseAudio (vía `libpulse-simple`, cargada en runtime); `none` equivale a `--no-audio`. Un backend forzado que no arranca ⇒ vídeo sin audio (no hay fallback silencioso) |
 | `--sub [fichero.srt\|.ass]` | Activa subtítulos: sin valor usa la pista de texto embebida del contenedor; con fichero carga subtítulos externos. Sin `--sub` no se muestran subtítulos |
 | `--no-subs` | Desactiva subtítulos aunque se pase `--sub` (compatibilidad) |
 | `--aid <N>` / `--alang <idioma>` | Pista de audio inicial: por índice 1-based dentro de las pistas de audio (`--aid 2` = segunda) o por idioma (`--alang spa`), como mpv. Sin match → pista "best" de FFmpeg |

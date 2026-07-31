@@ -1,0 +1,173 @@
+# Soporte Termux (Android) SIN dispositivo físico: compila y testea rtv
+# dentro de contenedores termux/termux-docker — un userland Termux REAL
+# (bionic libc, prefix /data/data/com.termux/files/usr, pkg/apt), la misma
+# plataforma que un móvil salvo por los componentes Android no presentes
+# (DalvikVM, AAudio/OpenSLES — justo por eso rtv usa PulseAudio allí).
+#
+#   * x86_64  : runner normal — valida compilación nativa Termux + smoke
+#               test en pty + AUDIO REAL vía backend pulse contra un
+#               PulseAudio 17 con null-sink (idéntico al paquete de Termux).
+#   * aarch64 : runner ARM (ubuntu-22.04-arm, gratis en repos públicos) —
+#               contenedor aarch64 NATIVO (sin qemu). Misma validación y
+#               además produce el artefacto instalable en el móvil
+#               (rtv + FFmpeg 7.1 empaquetado, como el resto de plataformas).
+#
+# FFmpeg: los repos de Termux van por 8.x y ffmpeg-the-third 5.0 solo
+# compila contra 7.1.x (ver BUILD-WINDOWS.md) → scripts/build-termux.sh
+# compila FFmpeg 7.1.5 desde fuente dentro del contenedor (cacheado).
+name: termux
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # HOME del usuario termux dentro del contenedor.
+  TXH: /data/data/com.termux/files/home
+
+jobs:
+  termux:
+    name: termux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      # FFmpeg 7.1.5 compilado DENTRO del contenedor, cacheado entre runs
+      # (la clave incluye el script por si cambia la receta).
+      - name: Cache FFmpeg (Termux)
+        id: ffcache
+        uses: actions/cache@v6
+        with:
+          path: ffcache
+          key: ffmpeg-termux-${{ matrix.arch }}-7.1.5-${{ hashFiles('scripts/build-termux.sh') }}
+
+      - name: Arrancar contenedor Termux
+        run: |
+          # seccomp unconfined: los contenedores termux (sobre todo arm)
+          # necesitan syscalls que el perfil default de Docker bloquea
+          # (personality — ver README de termux-docker).
+          docker run -d --name tx --security-opt seccomp=unconfined \
+            termux/termux-docker:${{ matrix.arch }} sleep infinity
+          docker exec tx uname -m
+
+      - name: Copiar repo (+ caché FFmpeg) al contenedor
+        run: |
+          docker cp . tx:$TXH/rtv
+          if [ -d ffcache/rtv-ffmpeg ]; then
+            docker cp ffcache/rtv-ffmpeg tx:$TXH/rtv-ffmpeg
+          fi
+          # El COPY del runner llega como root; el usuario termux es 1000.
+          docker exec -u 0 tx chown -R 1000:1000 $TXH
+
+      - name: Build nativo (scripts/build-termux.sh — el MISMO del usuario)
+        run: |
+          docker exec -e HOME=$TXH -w $TXH/rtv tx \
+            bash scripts/build-termux.sh
+
+      - name: Exportar FFmpeg al caché
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ffcache
+          docker cp tx:$TXH/rtv-ffmpeg ffcache/rtv-ffmpeg
+
+      - name: Fixtures + deps de test (python, ffmpeg CLI, pulseaudio)
+        run: |
+          # ffmpeg de los repos Termux (8.x): SOLO como fixture de test.
+          # No interfiere con el 7.1 empaquetado (sonames distintos y el
+          # wrapper rtv antepone su propio LD_LIBRARY_PATH).
+          docker exec -e HOME=$TXH tx pkg install -y python ffmpeg pulseaudio
+          # Vídeo sin audio (smoke) y con audio (test del backend pulse).
+          docker exec -e HOME=$TXH tx sh -c \
+            'ffmpeg -y -loglevel error -f lavfi -i testsrc2=size=320x180:rate=30 -t 2 -c:v mpeg4 -an $HOME/smoke.mp4'
+          docker exec -e HOME=$TXH tx sh -c \
+            'ffmpeg -y -loglevel error -f lavfi -i testsrc2=size=320x180:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 6 -c:v mpeg4 -c:a aac -shortest $HOME/smoke_audio.mp4'
+
+      - name: Smoke test (pty real, --no-audio)
+        run: |
+          docker exec -e HOME=$TXH -w $TXH/rtv tx \
+            python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke.mp4
+
+      - name: Test de AUDIO real (PulseAudio null-sink, backend pulse)
+        run: |
+          # PulseAudio 17 (el mismo paquete que instala un usuario Termux)
+          # con null-sink: no hay hardware de audio en el contenedor, pero
+          # el SERVIDOR y el protocolo son 100% reales — pa_simple_new,
+          # write con pacing, get_latency... todo el camino de rtv.
+          # Protocolo TCP loopback (receta estándar de Termux): el socket
+          # unix por defecto vive en un runtime-dir por-sesión que NO se
+          # comparte de forma fiable entre distintos `docker exec`.
+          docker exec -e HOME=$TXH tx sh -c \
+            'pulseaudio --start --exit-idle-time=-1 --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" \
+             && PULSE_SERVER=127.0.0.1 pactl load-module module-null-sink sink_name=ci_sink \
+             && PULSE_SERVER=127.0.0.1 pactl info | head -3'
+          # Backend explícito pulse: exige >=20 writes del feeder, reloj
+          # de audio llegando a >=1 s y monotonía >=95% (audio REAL
+          # anclando el master clock, no solo "no crashea").
+          docker exec -e HOME=$TXH -e PULSE_SERVER=127.0.0.1 -w $TXH/rtv tx \
+            python3 ci/termux_audio_check.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke_audio.mp4 --audio-backend pulse
+          # `auto` DENTRO de Termux debe elegir pulse él solo (la
+          # detección va por TERMUX_VERSION/PREFIX).
+          docker exec -e HOME=$TXH -e PULSE_SERVER=127.0.0.1 -e TERMUX_VERSION=docker -w $TXH/rtv tx \
+            python3 ci/termux_audio_check.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke_audio.mp4
+
+      - name: CLI --audio-backend (none + valor inválido)
+        run: |
+          # none: reproduce sin audio y sale limpio.
+          docker exec -e HOME=$TXH -w $TXH/rtv tx sh -c \
+            'python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv $HOME/smoke.mp4 --audio-backend none'
+          # inválido: exit 2 con mensaje visible.
+          set +e
+          docker exec -e HOME=$TXH tx rtv --audio-backend patata $TXH/smoke.mp4
+          code=$?
+          set -e
+          if [ "$code" != "2" ]; then
+            echo "esperaba exit 2, obtuve $code"; exit 1
+          fi
+
+      - name: Empaquetar (rtv + FFmpeg 7.1 autocontenido)
+        id: pkg
+        run: |
+          VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          P=rtv-${VER}-termux-${{ matrix.arch }}
+          mkdir -p "$P/libs"
+          docker cp tx:$TXH/rtv/target/release/rtv "$P/rtv.bin"
+          docker cp tx:$TXH/rtv-ffmpeg/lib "$P/ffmpeg-lib"
+          # Solo las shared libs (sin pkgconfig ni headers).
+          mv "$P"/ffmpeg-lib/*.so* "$P/libs/" 2>/dev/null || true
+          rm -rf "$P/ffmpeg-lib"
+          docker cp tx:$TXH/rtv-ffmpeg/LICENSE.txt "$P/LICENSE-FFmpeg.txt" || true
+          # Lanzador relativo: funciona desde cualquier ruta de Termux.
+          cat > "$P/rtv" << 'WRAP'
+          #!/data/data/com.termux/files/usr/bin/bash
+          DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/libs:${LD_LIBRARY_PATH:-}"
+          exec "$DIR/rtv.bin" "$@"
+          WRAP
+          chmod +x "$P/rtv" "$P/rtv.bin"
+          cat > "$P/README.txt" << 'DOC'
+          rtv para Termux (Android)
+          =========================
+          1. Copia esta carpeta a tu $HOME de Termux y (opcional) enlaza:
+               ln -sf "$PWD/rtv" $PREFIX/bin/rtv
+          2. Audio: pkg install pulseaudio
+                    pulseaudio --start --exit-idle-time=-1
+          3. Reproduce: rtv video.mp4
+          Requiere Termux de F-Droid (no la build abandonada de Play Store).
+          DOC
+          tar -czf "$P.tar.gz" "$P"
+          echo "pkg=$P" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.tar.gz
+          if-no-files-found: error

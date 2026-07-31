@@ -18,6 +18,7 @@
 //!     como antes. El callback rellena con ceros como defensa 2ª.
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "cpal-audio")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use ffmpeg_the_third as ffmpeg;
@@ -33,6 +34,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::audio_backend::AudioChunk;
+#[cfg(feature = "cpal-audio")]
+use crate::audio_backend::SinkFeeder;
 use crate::clock::FfClock;
 
 /// Mensajes de control al hilo audio-decoder.
@@ -46,30 +50,32 @@ enum AudioMsg {
     Switch { stream_index: usize, at_secs: f64, serial: i32 },
 }
 
-/// Bloque de muestras con serial + PTS del primer sample.
-struct AudioChunk {
-    samples: Vec<f32>,
-    /// Serial en el que se produjo. El player bumpea el serial en
-    /// cada seek → chunks con serial viejo son residuo.
-    serial: i32,
-    /// PTS (segundos) del primer sample del chunk.
-    first_pts: f64,
-}
-
 pub struct AudioHandle {
     stop: Arc<AtomicBool>,
     volume: Arc<AtomicU8>,
     msg_tx: Sender<AudioMsg>,
     pub clock: Arc<FfClock>,
     pub has_audio: bool,
+    #[allow(dead_code)] // API informativa (diagnóstico/futuros usos)
     pub sample_rate: u32,
+    #[allow(dead_code)]
     pub channels: u16,
     /// Índice del stream de audio con el que ARRANCÓ el pipeline
     /// (best o el pedido por --aid/--alang). Informativo: el player
     /// lo usa para posicionar el ciclado de pistas.
     pub track_index: Option<usize>,
     decoder_join: Option<thread::JoinHandle<()>>,
-    pub stream: Option<cpal::Stream>,
+    sink: Option<SinkRuntime>,
+    /// Backend activo ("cpal" | "pulse" | "none") — verbose/diagnóstico.
+    pub backend_name: &'static str,
+}
+
+/// Runtime del sink de salida activo.
+enum SinkRuntime {
+    #[cfg(feature = "cpal-audio")]
+    Cpal(cpal::Stream),
+    #[cfg(feature = "pulse")]
+    Pulse(crate::audio_backend::pulse::PulseRuntime),
 }
 
 impl AudioHandle {
@@ -116,17 +122,28 @@ impl AudioHandle {
     }
 
     pub fn pause_stream(&self) {
-        if let Some(s) = self.stream.as_ref() {
-            if let Err(e) = s.pause() {
-                eprintln_verbose(&format!("cpal pause falló: {e}"));
+        match self.sink.as_ref() {
+            #[cfg(feature = "cpal-audio")]
+            Some(SinkRuntime::Cpal(s)) => {
+                if let Err(e) = s.pause() {
+                    eprintln_verbose(&format!("cpal pause falló: {e}"));
+                }
             }
+            // pulse: la API simple no tiene pausa nativa — el feeder
+            // emite silencio mientras clock.paused está activo (misma
+            // defensa 2ª que ya tenía el callback de cpal).
+            _ => {}
         }
     }
     pub fn play_stream(&self) {
-        if let Some(s) = self.stream.as_ref() {
-            if let Err(e) = s.play() {
-                eprintln_verbose(&format!("cpal play falló: {e}"));
+        match self.sink.as_ref() {
+            #[cfg(feature = "cpal-audio")]
+            Some(SinkRuntime::Cpal(s)) => {
+                if let Err(e) = s.play() {
+                    eprintln_verbose(&format!("cpal play falló: {e}"));
+                }
             }
+            _ => {}
         }
     }
 
@@ -141,6 +158,12 @@ impl AudioHandle {
     ///     saliendo y el SO recoge el hilo. Nunca colgamos la salida.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // El writer pulse bloquea en pa_simple_write como mucho
+        // ~tlength (100 ms): join acotado propio dentro de stop().
+        #[cfg(feature = "pulse")]
+        if let Some(SinkRuntime::Pulse(rt)) = self.sink.as_mut() {
+            rt.stop();
+        }
         if let Some(j) = self.decoder_join.take() {
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {
@@ -164,6 +187,94 @@ impl Drop for AudioHandle {
     }
 }
 
+/// Preferencia de backend de salida (--audio-backend).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackendPref {
+    /// Termux/Android: pulse→cpal; resto: cpal→pulse.
+    Auto,
+    Cpal,
+    Pulse,
+    /// Sin audio (equivale a --no-audio).
+    NoAudio,
+}
+
+impl BackendPref {
+    pub fn parse(s: &str) -> Result<BackendPref> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(BackendPref::Auto),
+            "cpal" => Ok(BackendPref::Cpal),
+            "pulse" | "pulseaudio" => Ok(BackendPref::Pulse),
+            "none" | "off" => Ok(BackendPref::NoAudio),
+            other => Err(anyhow!(
+                "--audio-backend inválido: {other:?} (valores: auto|cpal|pulse|none)"
+            )),
+        }
+    }
+}
+
+/// ¿Estamos corriendo dentro de Termux? (app Android, prefix propio).
+fn is_termux() -> bool {
+    std::env::var_os("TERMUX_VERSION").is_some()
+        || std::env::var("PREFIX")
+            .map(|p| p.contains("com.termux"))
+            .unwrap_or(false)
+}
+
+/// Plan de sink elegido (conexión abierta, aún sin arrancar).
+enum SinkPlan {
+    #[cfg(feature = "cpal-audio")]
+    Cpal(cpal::Device, cpal::StreamConfig),
+    #[cfg(feature = "pulse")]
+    Pulse(crate::audio_backend::pulse::PulseSink),
+}
+
+fn try_cpal_plan(out_channels: u16) -> Option<(SinkPlan, u32)> {
+    #[cfg(feature = "cpal-audio")]
+    {
+        let host = cpal::default_host();
+        let device = host.default_output_device()?;
+        let supported = match device.default_output_config() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln_verbose(&format!("cpal default_output_config falló: {e}"));
+                return None;
+            }
+        };
+        let rate = supported.sample_rate().0;
+        let config = cpal::StreamConfig {
+            channels: out_channels,
+            sample_rate: cpal::SampleRate(rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        return Some((SinkPlan::Cpal(device, config), rate));
+    }
+    #[cfg(not(feature = "cpal-audio"))]
+    {
+        let _ = out_channels;
+        None
+    }
+}
+
+fn try_pulse_plan(out_channels: u16) -> Option<(SinkPlan, u32)> {
+    #[cfg(feature = "pulse")]
+    {
+        // 48 kHz: nativo de PulseAudio en Android/Termux y estándar
+        // de facto; swresample normaliza cualquier pista a esto.
+        match crate::audio_backend::pulse::PulseSink::try_open(48000, out_channels) {
+            Ok(s) => return Some((SinkPlan::Pulse(s), 48000)),
+            Err(e) => {
+                eprintln_verbose(&format!("pulse no disponible: {e}"));
+                return None;
+            }
+        }
+    }
+    #[cfg(not(feature = "pulse"))]
+    {
+        let _ = out_channels;
+        None
+    }
+}
+
 /// `start_track`: índice del stream de audio del contenedor con el
 /// que arrancar (de `--aid`/`--alang`); `None` = pista "best" de
 /// FFmpeg. Si el índice no es un stream de audio válido se cae a
@@ -172,6 +283,7 @@ pub fn spawn<P: AsRef<Path>>(
     path: P,
     clock: Arc<FfClock>,
     start_track: Option<usize>,
+    backend: BackendPref,
 ) -> Result<AudioHandle> {
     let path = path.as_ref().to_owned();
 
@@ -188,24 +300,26 @@ pub fn spawn<P: AsRef<Path>>(
     };
     drop(ictx);
 
-    let host = cpal::default_host();
-    let device = match host.default_output_device() {
-        Some(d) => d,
-        None => return Ok(no_audio(clock)),
-    };
-    let supported = match device.default_output_config() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln_verbose(&format!("cpal default_output_config falló: {e}"));
-            return Ok(no_audio(clock));
+    // --- Selección del backend de salida ---
+    // Una preferencia explícita NO cae a otro backend (fallo → sin
+    // audio, con el motivo en --verbose). `Auto` prueba en orden.
+    let out_channels: u16 = 2;
+    let plan = match backend {
+        BackendPref::NoAudio => None,
+        BackendPref::Cpal => try_cpal_plan(out_channels),
+        BackendPref::Pulse => try_pulse_plan(out_channels),
+        BackendPref::Auto => {
+            if is_termux() {
+                // cpal (AAudio/NDK) no funciona en un proceso de
+                // consola Termux: pulse primero.
+                try_pulse_plan(out_channels).or_else(|| try_cpal_plan(out_channels))
+            } else {
+                try_cpal_plan(out_channels).or_else(|| try_pulse_plan(out_channels))
+            }
         }
     };
-    let out_sample_rate = supported.sample_rate().0;
-    let out_channels: u16 = 2;
-    let stream_config = cpal::StreamConfig {
-        channels: out_channels,
-        sample_rate: cpal::SampleRate(out_sample_rate),
-        buffer_size: cpal::BufferSize::Default,
+    let Some((plan, out_sample_rate)) = plan else {
+        return Ok(no_audio(clock));
     };
 
     let (samples_tx, samples_rx) = bounded::<AudioChunk>(64);
@@ -234,226 +348,64 @@ pub fn spawn<P: AsRef<Path>>(
             })?
     };
 
-    // Estado del callback (owned por la closure).
-    let stream = {
-        let stop_cb = stop.clone();
-        let clock_cb = clock.clone();
-        let volume_cb = volume.clone();
-        // Log de depuración opcional del callback (RTV_AUDIO_DEBUG=/ruta).
-        let mut dbg_log: Option<std::io::BufWriter<std::fs::File>> = std::env::var(
-            "RTV_AUDIO_DEBUG",
-        )
-        .ok()
-        .and_then(|p| std::fs::File::create(p).ok().map(std::io::BufWriter::new));
-        let dbg_origin = std::time::Instant::now();
-        let mut dbg_count: u64 = 0;
-        // Estado local del callback:
-        let mut leftover: Vec<f32> = Vec::new();
-        let mut leftover_offset = 0usize;
-        let mut leftover_serial: i32 = 0;
-        let mut leftover_first_pts: f64 = 0.0;
-        // Muestras dentro del chunk actual ya emitidas (per-channel).
-        let mut samples_emitted_in_chunk: usize = 0;
-        // Estimación SUAVIZADA de la latencia de salida. El tamaño del
-        // buffer del callback puede alternar (p.ej. PulseAudio pide
-        // 25 ms / 50 ms alternos); usar el tamaño del callback ACTUAL
-        // como estimación metía un diente de sierra de ±25 ms en el
-        // reloj de audio que el vídeo perseguía (patrón -80/-40/+10 ms
-        // en el sync-log). Un EMA converge a la media estable y el
-        // reloj queda liso — el offset constante residual es idéntico
-        // para todos los frames y el vídeo lo sigue sin jitter.
-        let mut latency_ema: f64 = 0.0;
-        // LIMITADOR DE TASA del reloj de audio: el PTS "que se oye" no
-        // puede avanzar más rápido que el tiempo mural (×1.02 de
-        // margen). Al conectar, PulseAudio consume ~0.4 s de audio DE
-        // GOLPE para llenar su prebuffer reportando delay=0 — sin el
-        // limitador el reloj saltaba +0.4 s en un instante y el vídeo
-        // (decode-bound con AV1 4K) quedaba ~0.5 s por detrás PARA
-        // SIEMPRE (el decode no da para recuperar déficit). El exceso
-        // capado equivale a la latencia real no reportada del sink.
-        // Se resetea al cambiar el serial (seek).
-        let mut rate_lim: Option<(f64, std::time::Instant)> = None;
-        let mut rate_lim_serial: i32 = i32::MIN;
-
-        let build = device.build_output_stream(
-            &stream_config,
-            move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                // ---- Salida silenciosa ante stop / pause ----
-                if stop_cb.load(Ordering::Relaxed) {
-                    out.fill(0.0);
-                    return;
-                }
-                if clock_cb.paused.load(Ordering::Acquire) != 0 {
-                    out.fill(0.0);
-                    return;
-                }
-                let vol_pct = volume_cb.load(Ordering::Relaxed) as f32 / 100.0;
-                // Serial válido AHORA (único serial compartido por reloj
-                // y pipeline). Se lee una vez al principio: si un seek
-                // ocurre a mitad de callback, el `set_pts` final será
-                // rechazado por el guard de serial del reloj.
-                let current_serial = clock_cb.current_serial();
-
-                let mut filled = 0usize;
-                // PTS del PRIMER sample válido emitido en esta llamada
-                // y su offset (en frames por-canal) dentro de `out`.
-                // El primer sample de `out` sale por el DAC en
-                // `ts.playback` — con eso anclamos el reloj.
-                let mut first_pts_emitted: Option<(f64, usize)> = None;
-
-                while filled < out.len() {
-                    // Chunk actual con serial viejo → DESCARTAR AL
-                    // INSTANTE (sin "reproducir" su duración como
-                    // silencio, que retrasaba el audio fresco tras un
-                    // seek en decenas de ms).
-                    if leftover_offset < leftover.len() && leftover_serial != current_serial {
-                        leftover_offset = leftover.len();
-                        continue;
-                    }
-                    // Chunk agotado → traer otro.
-                    if leftover_offset >= leftover.len() {
-                        match samples_rx.try_recv() {
-                            Ok(chunk) => {
-                                leftover = chunk.samples;
-                                leftover_offset = 0;
-                                leftover_serial = chunk.serial;
-                                leftover_first_pts = chunk.first_pts;
-                                samples_emitted_in_chunk = 0;
-                            }
-                            Err(_) => {
-                                // Underrun: silencio.
-                                out[filled..].fill(0.0);
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    // Emisión válida.
-                    if first_pts_emitted.is_none() {
-                        let pts_here = leftover_first_pts
-                            + samples_emitted_in_chunk as f64 / out_sample_rate as f64;
-                        first_pts_emitted =
-                            Some((pts_here, filled / out_channels as usize));
-                    }
-                    let take = (out.len() - filled).min(leftover.len() - leftover_offset);
-                    for i in 0..take {
-                        out[filled + i] = leftover[leftover_offset + i] * vol_pct;
-                    }
-                    filled += take;
-                    leftover_offset += take;
-                    samples_emitted_in_chunk += take / out_channels as usize;
-                }
-
-                // ---- Actualizar audclk con COMPENSACIÓN DE LATENCIA ----
-                if let Some((pts_first, frame_offset)) = first_pts_emitted {
-                    // cpal nos da:
-                    //   playback = ts.playback  (cuándo el PRIMER frame
-                    //                            de `out` sale por el DAC)
-                    //   callback = ts.callback  (ahora)
-                    //   delay = playback - callback  (>0 normalmente)
-                    //
-                    // El primer sample VÁLIDO emitido está en el frame
-                    // `frame_offset` del buffer, así que sonará en
-                    //   playback + frame_offset/rate.
-                    // Por tanto el PTS que se OYE en este instante es:
-                    //   pts_heard_now = pts_first
-                    //                   - frame_offset/rate
-                    //                   - delay
-                    // (la versión anterior usaba el PTS del ÚLTIMO
-                    // sample emitido sin restar la duración del buffer
-                    // → el reloj de audio corría ADELANTADO ~1 buffer
-                    // (5–40 ms) de forma sistemática).
+    // --- Arranque del sink elegido ---
+    // Toda la lógica del reloj de audio (descarte por serial, EMA de
+    // latencia, limitador de tasa) vive en SinkFeeder (audio_backend.rs)
+    // y es IDÉNTICA para ambos backends.
+    let (sink, backend_name): (Option<SinkRuntime>, &'static str) = match plan {
+        #[cfg(feature = "cpal-audio")]
+        SinkPlan::Cpal(device, stream_config) => {
+            let mut feeder = SinkFeeder::new(
+                stop.clone(),
+                clock.clone(),
+                volume.clone(),
+                samples_rx,
+                out_sample_rate,
+                out_channels,
+            );
+            let build = device.build_output_stream(
+                &stream_config,
+                move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    // cpal reporta: playback = cuándo el PRIMER frame
+                    // de `out` sale por el DAC; callback = ahora.
                     let ts = info.timestamp();
                     let reported_delay = ts
                         .playback
                         .duration_since(&ts.callback)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or(0.0);
-                    // Algunos backends (p.ej. ALSA→Pulse, null sinks,
-                    // ciertos drivers) reportan delay=0 aunque el
-                    // buffer que estamos rellenando NO sonará hasta que
-                    // drene el período en curso. Estimación mínima
-                    // robusta: la duración de UN período del callback
-                    // (ffplay hace lo mismo con audio_hw_buf_size).
-                    let buf_period_secs =
-                        (out.len() / out_channels as usize) as f64 / out_sample_rate as f64;
-                    // Clamp superior: tras un underrun (ring vacío por
-                    // CPU starving) PulseAudio puede reportar delays
-                    // absurdos (>1 s) — sin límite, el reloj de audio
-                    // saltaba SEGUNDOS hacia atrás y el vídeo entraba
-                    // en free-run persiguiendo un master roto.
-                    let raw_delay = reported_delay.max(buf_period_secs).min(0.5);
-                    if latency_ema == 0.0 {
-                        latency_ema = raw_delay;
-                    } else {
-                        latency_ema = 0.9 * latency_ema + 0.1 * raw_delay;
+                    feeder.fill(out, reported_delay);
+                },
+                |err| eprintln_verbose(&format!("cpal stream error: {err}")),
+                None,
+            );
+            match build {
+                Ok(s) => match s.play() {
+                    Ok(()) => (Some(SinkRuntime::Cpal(s)), "cpal"),
+                    Err(e) => {
+                        eprintln_verbose(&format!("cpal play falló: {e}"));
+                        (None, "none")
                     }
-                    let delay_secs = latency_ema;
-                    let offset_secs = frame_offset as f64 / out_sample_rate as f64;
-                    let mut pts_being_heard =
-                        (pts_first - offset_secs - delay_secs).max(0.0);
-                    // ---- Limitador de tasa (ver arriba) ----
-                    let now_i = std::time::Instant::now();
-                    if rate_lim_serial != current_serial {
-                        rate_lim_serial = current_serial;
-                        rate_lim = None;
-                    }
-                    if let Some((prev_pts, prev_wall)) = rate_lim {
-                        // Si los callbacks pararon >250 ms (stall del
-                        // sink: arranque de PulseAudio, suspend...) el
-                        // DAC NO consumió durante ese hueco — dt=0, no
-                        // regalamos ese tiempo al reloj. (Los callbacks
-                        // llegan cuando el sink NECESITA datos; si no
-                        // llegan, no está sonando nada nuevo.)
-                        let raw_dt =
-                            now_i.duration_since(prev_wall).as_secs_f64();
-                        let dt = if raw_dt > 0.25 { 0.0 } else { raw_dt };
-                        // ×1.02: margen para drift de sample-rate. SIN
-                        // término constante por callback: +2 ms/callback
-                        // con callbacks de 5 ms era ×1.4 realtime y el
-                        // burst de prebuffer se colaba entero.
-                        let cap = prev_pts + dt * 1.02;
-                        if pts_being_heard > cap {
-                            pts_being_heard = cap;
-                        }
-                    }
-                    rate_lim = Some((pts_being_heard, now_i));
-                    clock_cb.set_pts(pts_being_heard, current_serial);
-                    if let Some(log) = dbg_log.as_mut() {
-                        use std::io::Write as _;
-                        dbg_count += 1;
-                        let _ = writeln!(
-                            log,
-                            "{:.4} cb#{} buf={} pts_first={:.4} rep_delay={:.4} set={:.4}",
-                            dbg_origin.elapsed().as_secs_f64(),
-                            dbg_count,
-                            out.len(),
-                            pts_first,
-                            reported_delay,
-                            pts_being_heard,
-                        );
-                    }
-                }
-            },
-            |err| eprintln_verbose(&format!("cpal stream error: {err}")),
-            None,
-        );
-        match build {
-            Ok(s) => match s.play() {
-                Ok(()) => Some(s),
+                },
                 Err(e) => {
-                    eprintln_verbose(&format!("cpal play falló: {e}"));
-                    None
+                    eprintln_verbose(&format!("cpal build_output_stream falló: {e}"));
+                    (None, "none")
                 }
-            },
-            Err(e) => {
-                eprintln_verbose(&format!("cpal build_output_stream falló: {e}"));
-                None
             }
+        }
+        #[cfg(feature = "pulse")]
+        SinkPlan::Pulse(psink) => {
+            let rt = psink.start(
+                stop.clone(),
+                clock.clone(),
+                volume.clone(),
+                samples_rx,
+            );
+            (Some(SinkRuntime::Pulse(rt)), "pulse")
         }
     };
 
-    let has_audio = stream.is_some();
+    let has_audio = sink.is_some();
 
     Ok(AudioHandle {
         stop,
@@ -465,7 +417,8 @@ pub fn spawn<P: AsRef<Path>>(
         channels: out_channels,
         track_index: Some(audio_idx),
         decoder_join: Some(decoder_join),
-        stream,
+        sink,
+        backend_name,
     })
 }
 
@@ -482,7 +435,8 @@ fn no_audio(clock: Arc<FfClock>) -> AudioHandle {
         channels: 2,
         track_index: None,
         decoder_join: None,
-        stream: None,
+        sink: None,
+        backend_name: "none",
     }
 }
 

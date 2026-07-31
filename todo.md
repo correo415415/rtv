@@ -407,9 +407,9 @@ Riesgos conocidos:
 
 ---
 
-# Tarea pendiente (APARCADA por decisión del usuario): soporte Termux (Android)
+# ✅ HECHO (sesión 2026-07-31): soporte Termux (Android)
 
-Análisis de viabilidad hecho (sesión 2026-07-31); implementación NO empezada.
+Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesión.
 
 ## Conclusiones del análisis
 
@@ -440,19 +440,51 @@ Análisis de viabilidad hecho (sesión 2026-07-31); implementación NO empezada.
          (p.ej. `--features pulse`), seleccionable en runtime si
          PULSE_SERVER está definido.
 
-## Plan propuesto (cuando se retome)
+## Implementación (todo hecho)
 
-    [ ] Fase 1 — build + doc (sin código nuevo):
-        * Compilar EN Termux nativo (rustc de Termux, no cross): pkg install
-          rust clang pkg-config ffmpeg + cargo build --release.
-        * Verificar reproducción --no-audio en el terminal de Termux.
-        * Documentar en README sección "Termux" (incl. advertencia de la
-          versión de FFmpeg de los repos).
-    [ ] Fase 2 — audio:
-        * Feature `pulse`: backend de salida PulseAudio simple-API detrás
-          del mismo trait/canal que usa cpal (el reloj maestro no cambia:
-          sigue siendo el PTS efectivo escrito por el callback/writer).
-        * Guía: pulseaudio en Termux (`pulseaudio --start` +
-          PULSE_SERVER=127.0.0.1 o unix socket).
-    [ ] Fase 3 (opcional) — CI: job aarch64-linux-android de compile-check
-        (cross con NDK solo para detectar breakage, sin empaquetado).
+    [x] Fase 1 — build + doc:
+        * scripts/build-termux.sh: build nativo EN Termux (rustc de Termux).
+          Los repos de Termux ya sirven FFmpeg 8.1.2 (incompatible con
+          ffmpeg-the-third 5.0) → el script compila FFmpeg 7.1.5 desde
+          fuente (decode-only, +libdav1d, shared) en ~/rtv-ffmpeg con caché
+          por marker-file, y deja wrapper `rtv` en $PREFIX/bin con
+          LD_LIBRARY_PATH.
+        * README: sección "Termux (Android)" + fila --audio-backend en la
+          tabla de opciones.
+    [x] Fase 2 — audio:
+        * cpal pasa a feature opcional `cpal-audio`; nueva feature `pulse`
+          (default = ambas). En Termux se compila con
+          --no-default-features --features pulse.
+        * src/audio_backend.rs: SinkFeeder = extracción del "corazón" del
+          callback cpal (descarte por serial, EMA de latencia con clamp,
+          limitador ×1.02, un set_pts por fill, RTV_AUDIO_DEBUG) compartido
+          por ambos backends — cero duplicación del código crítico de sync.
+        * Backend PulseAudio vía pa_simple por dlopen (libloading, sin
+          dependencia de build/link): hilo escritor con bloques de 20 ms,
+          latencia real de pa_simple_get_latency, tlength ≈100 ms; el
+          write bloqueante da el pacing (como el callback de cpal).
+          Sin servidor Pulse → degradación limpia a no_audio.
+        * CLI --audio-backend auto|cpal|pulse|none (validado antes de
+          silenciar stderr, exit 2 si inválido). Auto en Termux
+          (TERMUX_VERSION/PREFIX) prueba pulse→cpal; en el resto cpal→pulse.
+          Backend explícito NO hace fallback. Log del backend con --verbose.
+    [x] Fase 3 — CI SIN dispositivo físico (mejor que el compile-check
+        propuesto): .github/workflows/termux.yml (workflow_dispatch) usa
+        imágenes termux/termux-docker — userland Termux REAL — en matriz
+        x86_64 (ubuntu-latest) + aarch64 nativo (ubuntu-22.04-arm):
+        build vía scripts/build-termux.sh (FFmpeg cacheado con actions/cache),
+        smoke pty, test de audio REAL: pulseaudio dentro del contenedor con
+        module-native-protocol-tcp (loopback) + null-sink +
+        ci/termux_audio_check.py (≥20 writes del feeder, PTS ≥1 s,
+        monotonía ≥95%) con --audio-backend pulse y con auto
+        (TERMUX_VERSION=docker), checks de CLI (none / valor inválido→2),
+        y empaqueta artefactos rtv-*-termux-{x86_64,aarch64} autocontenidos.
+
+## Validación local (sandbox, PulseAudio 17 + null-sink)
+
+    cargo check default y --no-default-features --features pulse: OK.
+    cargo test: 18/18. actionlint termux.yml: limpio.
+    termux_audio_check con pulse: 301 callbacks, PTS max 5.912 s,
+    monotonía 100%. auto: OK. Simulación TERMUX_VERSION → auto elige
+    pulse. --audio-backend patata → exit 2. El flujo del contenedor se
+    valida con el propio workflow en Actions (el sandbox no tiene docker).
