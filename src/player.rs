@@ -513,7 +513,16 @@ pub fn run(cfg: Config) -> Result<()> {
                     // (master desanclado → muestra el frame actual y
                     // espera) y al llegar el primer chunk de la pista
                     // nueva el reloj ancla y todo continúa en sync.
-                    if audio_handle.is_none() {
+                    //
+                    // OJO: el OSD informa según las pistas del
+                    // CONTENEDOR, no según exista dispositivo de
+                    // salida. Sin dispositivo (headless/CI, --no-audio
+                    // implícito por fallo de cpal) `audio_handle` es
+                    // None, pero el usuario sigue mereciendo el
+                    // feedback "Audio [2/2]: spa" / "única pista" al
+                    // ciclar — antes cualquier `a` en headless decía
+                    // "sin audio" aunque el fichero tuviera 2 pistas.
+                    if cfg.no_audio || audio_tracks.is_empty() {
                         osd = Some(("Audio: sin audio".to_string(), Instant::now()));
                     } else if audio_tracks.len() < 2 {
                         let label = audio_tracks
@@ -526,19 +535,23 @@ pub fn run(cfg: Config) -> Result<()> {
                         cur_audio_pos =
                             (cur_audio_pos as i64 + dir as i64).rem_euclid(n as i64) as usize;
                         let track = &audio_tracks[cur_audio_pos];
-                        let now_t = master.now().max(0.0);
-                        master.set(now_t);
+                        // El switch en caliente solo aplica si hay un
+                        // pipeline de audio vivo; sin dispositivo la
+                        // selección queda registrada (cur_audio_pos)
+                        // y el OSD confirma, sin tocar relojes.
                         if let Some(a) = audio_handle.as_ref() {
+                            let now_t = master.now().max(0.0);
+                            master.set(now_t);
                             a.switch_track(track.stream_index, now_t);
-                        }
-                        // NO es un seek de vídeo: el decoder sigue y el
-                        // aterrizaje del audio ancla el reloj en now_t.
-                        pending_audio_landing = false;
-                        frame_timer = wall_now_f64();
-                        if master.is_paused() {
-                            // En pausa el reloj queda re-apuntado; al
-                            // reanudar sonará la pista nueva desde aquí.
-                            show_one_frame_paused = false;
+                            // NO es un seek de vídeo: el decoder sigue y el
+                            // aterrizaje del audio ancla el reloj en now_t.
+                            pending_audio_landing = false;
+                            frame_timer = wall_now_f64();
+                            if master.is_paused() {
+                                // En pausa el reloj queda re-apuntado; al
+                                // reanudar sonará la pista nueva desde aquí.
+                                show_one_frame_paused = false;
+                            }
                         }
                         osd = Some((
                             format!("Audio [{}/{}]: {}", cur_audio_pos + 1, n, track.label()),
@@ -1038,6 +1051,19 @@ pub fn run(cfg: Config) -> Result<()> {
             } else {
                 frames_dropped_win += 1;
                 last_shown_pts = frame.pts;
+                // REVERTIR el `frame_timer += target_delay` de arriba:
+                // un frame dropeado NO consume slot de presentación.
+                // Sin esto, el catch-up post-seek (aterrizar en el
+                // keyframe y dropear hasta el target — p.ej. 134
+                // frames con GOPs de 10 s) empujaba frame_timer
+                // ~5 s HACIA EL FUTURO (134 × 40 ms), y como la
+                // resincronización solo cubre el atraso (now - timer
+                // > 100 ms), el player quedaba mostrando 1 frame
+                // cada 500 ms (el cap del sleep) durante ~10 s tras
+                // cada seek hacia atrás: cadencia rota, ráfagas de
+                // seeks colapsadas en un solo salto visible y gaps
+                // murales >1.5 s entre frames.
+                frame_timer -= target_delay;
                 continue;
             }
         } else {
