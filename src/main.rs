@@ -20,6 +20,7 @@ mod info;
 mod input;
 mod player;
 mod renderer;
+mod source;
 mod subs;
 mod terminfo;
 mod tracks;
@@ -31,8 +32,9 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "rtv", version, about = "Reproductor de vídeo de terminal (Rust)")]
 struct Cli {
-    /// Ruta al fichero de vídeo
-    path: PathBuf,
+    /// Fichero de vídeo, URL http/https directa, o página de un sitio
+    /// de vídeo (YouTube, Twitch, Vimeo…; requiere yt-dlp instalado).
+    path: String,
 
     /// NO reproducir: mostrar información del fichero (formato,
     /// duración, calidad, pistas de audio/subtítulos, capítulos…).
@@ -100,6 +102,18 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     hwdec: String,
 
+    /// Forzar resolución con yt-dlp para CUALQUIER URL (sitios que no
+    /// están en la lista automática pero que yt-dlp soporta).
+    #[arg(long)]
+    ytdl: bool,
+
+    /// Formato que se pide a yt-dlp (sintaxis de su opción -f). El
+    /// default "b" pide el mejor formato muxed (una sola URL).
+    /// Experimental: "bv*+ba/b" pide vídeo+audio en streams separados
+    /// (doble input).
+    #[arg(long, default_value = "b", value_name = "FMT")]
+    ytdl_format: String,
+
     /// Dejar que FFmpeg y sus codecs escriban a stderr (útil para depurar).
     #[arg(long)]
     verbose: bool,
@@ -126,6 +140,17 @@ fn main() -> Result<()> {
         }
     };
 
+    // Resolver la entrada ANTES de silenciar stderr: yt-dlp puede tardar
+    // y fallar, y sus errores deben verse. Para rutas locales y URLs
+    // directas esto no ejecuta nada (solo clasifica el argumento).
+    let src = match source::resolve(&cli.path, cli.ytdl, &cli.ytdl_format) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
     // Silenciar libav antes de tocar nada. Ver comentarios largos en el
     // repositorio para el razonamiento (tres capas de log).
     // Con --info NO se redirige stderr: el proceso no pinta en el
@@ -147,7 +172,14 @@ fn main() -> Result<()> {
     // --info: inspección sin reproducción. Sale antes de tocar el
     // terminal (ni raw mode ni alt screen): la salida es pipeable.
     if cli.info {
-        if let Err(e) = info::print_info(&cli.path) {
+        // Para URLs, el "nombre" útil es el título de yt-dlp o la URL
+        // original que tecleó el usuario (no la URL kilométrica del CDN).
+        let display = if source::is_url(&cli.path) {
+            Some(src.title.as_deref().unwrap_or(cli.path.as_str()))
+        } else {
+            None
+        };
+        if let Err(e) = info::print_info(&src.video, display) {
             eprintln!("error: {e:#}");
             std::process::exit(1);
         }
@@ -182,7 +214,8 @@ fn main() -> Result<()> {
     };
 
     player::run(player::Config {
-        path: cli.path,
+        path: src.video,
+        audio_path: src.audio,
         forced_backend: cli.backend,
         scale: cli.scale.clamp(0.1, 1.0),
         loop_video: cli.loop_video,

@@ -87,16 +87,20 @@ jobs:
           # ffmpeg (el CLI de apt) es solo para generar el vídeo del smoke
           # test; nasm para el asm x86 de FFmpeg; dav1d/va/drm se enlazan
           # dinámicamente y se empaquetan en el artefacto.
+          # libgnutls28-dev: TLS para el protocolo https de libavformat
+          # (reproducción por red). GnuTLS es LGPLv2.1+ — mantiene la
+          # licencia "LGPL 2.1 or later" del build (openssl/mbedtls
+          # exigirían --enable-version3).
           sudo apt-get install -y --no-install-recommends \
             libasound2-dev pkg-config patchelf clang libclang-dev nasm \
-            libdav1d-dev libva-dev libdrm-dev ffmpeg
+            libdav1d-dev libva-dev libdrm-dev libgnutls28-dev ffmpeg
 
       - name: Cache de FFmpeg compilado
         id: ffcache
         uses: actions/cache@v6
         with:
           path: ~/ffmpeg
-          key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-vaapi-${{ matrix.runner }}-v1
+          key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-vaapi-gnutls-${{ matrix.runner }}-v1
 
       - name: Compilar FFmpeg ${{ env.FF_SRC_VERSION }} desde fuente (LGPL mínimo)
         if: steps.ffcache.outputs.cache-hit != 'true'
@@ -118,13 +122,19 @@ jobs:
           # moderno) -> no se arrastra libX11 y familia al paquete.
           # Verificado en local: configure OK con CONFIG_VAAPI=1 y
           # CONFIG_LIBDAV1D=1, licencia "LGPL version 2.1 or later".
+          # gnutls = https (reproducción por red); network va enabled
+          # por defecto (http/tcp/hls…), solo falta la capa TLS.
           ./configure --prefix="$HOME/ffmpeg" \
             --enable-shared --disable-static \
             --disable-programs --disable-doc \
             --disable-avdevice --disable-avfilter \
             --disable-encoders --disable-muxers \
             --disable-xlib --disable-libxcb \
-            --enable-libdav1d --enable-vaapi
+            --enable-libdav1d --enable-vaapi \
+            --enable-gnutls
+          # Si https no quedó compilado, mejor reventar aquí que publicar
+          # un paquete sin reproducción por red.
+          grep -q "CONFIG_HTTPS_PROTOCOL 1" config_components.h
           make -j"$(nproc)"
           make install
           cp COPYING.LGPLv2.1 "$HOME/ffmpeg/LICENSE.txt"
@@ -163,6 +173,9 @@ jobs:
           done < <(LD_LIBRARY_PATH="$FFMPEG_DIR/lib" ldd target/release/rtv | awk '/=>/ {print $1, $3}')
           echo "libs empaquetadas: $count"; ls "dist/$pkg/lib/"
           test "$count" -ge 5   # sanity: al menos las 5 de ffmpeg
+          # https: la cadena gnutls (nettle/hogweed/gmp…) tiene que venir
+          # en el cierre — sin ella el paquete no reproduce por red TLS.
+          ls "dist/$pkg/lib/"libgnutls*
           # RPATH: $ORIGIN/lib en el binario; $ORIGIN en cada lib para que
           # resuelvan a sus hermanas del mismo dir (p.ej. avutil -> libva).
           patchelf --set-rpath '$ORIGIN/lib' "dist/$pkg/rtv"
@@ -191,6 +204,19 @@ jobs:
           # maneja mal el stdin no-TTY y el hijo moría con SIGABRT (exit 134).
           python3 ci/smoke_pty.py /tmp/smoke-pkg/rtv /tmp/smoke.mp4
 
+      - name: Smoke test de RED (http local, --info + reproducción)
+        run: |
+          set -euo pipefail
+          # Servidor http local sirviendo el fixture: valida la pila de
+          # red de libavformat de punta a punta (open → demux → decode
+          # → render) sin depender de hosts externos. La capa TLS ya
+          # quedó verificada en config.h + libgnutls empaquetada.
+          python3 -m http.server 8123 --bind 127.0.0.1 --directory /tmp &
+          srv=$!; trap 'kill $srv' EXIT
+          sleep 1
+          /tmp/smoke-pkg/rtv --info http://127.0.0.1:8123/smoke.mp4
+          python3 ci/smoke_pty.py /tmp/smoke-pkg/rtv http://127.0.0.1:8123/smoke.mp4
+
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.pkg.outputs.pkg }}
@@ -208,6 +234,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # https en Windows: los builds BtbN compilan con --enable-schannel
+      # (TLS nativo del sistema, verificado en BtbN/FFmpeg-Builds
+      # scripts.d/50-schannel.sh) — la reproducción por red funciona sin
+      # empaquetar nada extra.
       - name: Descargar FFmpeg ${{ env.FF_BRANCH }} shared (BtbN)
         shell: pwsh
         run: |
@@ -307,7 +337,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/ffmpeg
-          key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-${{ matrix.runner }}-v1
+          key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-sectransport-${{ matrix.runner }}-v1
 
       - name: Compilar FFmpeg ${{ env.FF_SRC_VERSION }} desde fuente (LGPL mínimo)
         if: steps.ffcache.outputs.cache-hit != 'true'
@@ -326,13 +356,18 @@ jobs:
           # Config mínima para rtv: solo DECODE. Sin avfilter/avdevice (la
           # crate no los usa), sin encoders/muxers. dav1d = AV1 por software
           # decente; VideoToolbox = hwdec (--hwdec auto de rtv).
+          # SecureTransport = https con el TLS del sistema (framework
+          # Security de macOS): nada extra que empaquetar. Explícito
+          # para que configure falle ruidosamente si no está.
           ./configure --prefix="$HOME/ffmpeg" \
             --enable-shared --disable-static \
             --disable-programs --disable-doc \
             --disable-avdevice --disable-avfilter \
             --disable-encoders --disable-muxers \
             --enable-libdav1d \
-            --enable-videotoolbox --enable-audiotoolbox
+            --enable-videotoolbox --enable-audiotoolbox \
+            --enable-securetransport
+          grep -q "CONFIG_HTTPS_PROTOCOL 1" config_components.h
           make -j"$(sysctl -n hw.ncpu)"
           make install
           cp COPYING.LGPLv2.1 "$HOME/ffmpeg/LICENSE.txt"
@@ -469,6 +504,18 @@ jobs:
           docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx \
             python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke.mp4
 
+      - name: Smoke test de RED (http local dentro del userland Termux)
+        run: |
+          # Valida la pila de red de libavformat (open→demux→decode) en
+          # bionic. La capa TLS quedó verificada en config.h del build.
+          docker exec -d -u 1000 -e HOME=$TXH tx \
+            python3 -m http.server 8123 --bind 127.0.0.1 --directory $TXH
+          sleep 2
+          docker exec -u 1000 -e HOME=$TXH tx \
+            rtv --info http://127.0.0.1:8123/smoke.mp4
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx \
+            python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv http://127.0.0.1:8123/smoke.mp4
+
       - name: Test de AUDIO real (PulseAudio null-sink, backend pulse)
         run: |
           # PulseAudio 17 (el mismo paquete que instala un usuario Termux)
@@ -524,8 +571,9 @@ jobs:
           docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx sh -c \
             'python3 ci/termux_bundle_libs.py target/release/rtv $HOME/bundle-libs $HOME/rtv-ffmpeg/lib $PREFIX/lib'
           docker cp tx:$TXH/bundle-libs "$P/libs"
-          # Sanity: las 5 familias de FFmpeg + libdav1d tienen que estar.
-          for lib in libavutil libavcodec libavformat libswscale libswresample libdav1d; do
+          # Sanity: las 5 familias de FFmpeg + libdav1d + libgnutls
+          # (https) tienen que estar.
+          for lib in libavutil libavcodec libavformat libswscale libswresample libdav1d libgnutls; do
             ls "$P/libs/$lib"*.so* >/dev/null || { echo "FALTA $lib en el paquete"; exit 1; }
           done
           docker cp tx:$TXH/rtv-ffmpeg/LICENSE.txt "$P/LICENSE-FFmpeg.txt" || true

@@ -17,18 +17,25 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 /// Punto de entrada de `--info`. Imprime a stdout y devuelve error solo
-/// si el fichero no se puede abrir/demuxear.
-pub fn print_info(path: &Path) -> Result<()> {
-    let ictx = ffmpeg::format::input(path)
+/// si el fichero no se puede abrir/demuxear. `display` sustituye al
+/// nombre derivado de la ruta (para URLs: título de yt-dlp o la URL que
+/// escribió el usuario, no la del CDN).
+pub fn print_info(path: &Path, display: Option<&str>) -> Result<()> {
+    let ictx = crate::source::open(path)
         .with_context(|| format!("no se pudo abrir {}", path.display()))?;
     let color = std::io::stdout().is_terminal();
-    print!("{}", render(path, &ictx, color));
+    print!("{}", render(path, &ictx, color, display));
     Ok(())
 }
 
 /// Construye el informe completo como String (separado de print_info
 /// para poder testearlo).
-fn render(path: &Path, ictx: &ffmpeg::format::context::Input, color: bool) -> String {
+fn render(
+    path: &Path,
+    ictx: &ffmpeg::format::context::Input,
+    color: bool,
+    display: Option<&str>,
+) -> String {
     let mut o = String::new();
     let h = |s: &str| {
         if color {
@@ -47,12 +54,17 @@ fn render(path: &Path, ictx: &ffmpeg::format::context::Input, color: bool) -> St
 
     // ------------------------------------------------------- Fichero --
     let _ = writeln!(o, "{}", h("Fichero"));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+    let name = display.map(str::to_string).unwrap_or_else(|| {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    });
     let _ = writeln!(o, "  Nombre:     {}", b(&name));
-    let _ = writeln!(o, "  Ruta:       {}", path.display());
+    // Para URLs no hay ruta local ni metadata de fichero: la URL del
+    // CDN puede medir >1 KB y no aporta nada — se omite la línea.
+    if display.is_none() {
+        let _ = writeln!(o, "  Ruta:       {}", path.display());
+    }
     if let Ok(md) = std::fs::metadata(path) {
         let _ = writeln!(o, "  Tamaño:     {}", human_size(md.len()));
         if let Ok(mtime) = md.modified() {

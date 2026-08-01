@@ -23,7 +23,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use ffmpeg_the_third as ffmpeg;
 use ffmpeg::format::sample::Type as SampleType;
-use ffmpeg::format::{input, Sample as SampleFormat};
+use ffmpeg::format::Sample as SampleFormat;
 use ffmpeg::media::Type as MediaType;
 use ffmpeg::software::resampling::context::Context as SwrCtx;
 use ffmpeg::util::frame::audio::Audio as AudioFrame;
@@ -287,7 +287,7 @@ pub fn spawn<P: AsRef<Path>>(
 ) -> Result<AudioHandle> {
     let path = path.as_ref().to_owned();
 
-    let ictx = input(&path).with_context(|| format!("abriendo {:?}", path))?;
+    let ictx = crate::source::open(&path).with_context(|| format!("abriendo {:?}", path))?;
     let requested = start_track.filter(|&i| {
         ictx.stream(i)
             .map(|s| s.parameters().medium() == MediaType::Audio)
@@ -523,7 +523,7 @@ fn audio_decode_loop(
     msg_rx: Receiver<AudioMsg>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut ictx = input(&path)?;
+    let mut ictx = crate::source::open(&path)?;
     // Índice de la pista ACTIVA (cambia con AudioMsg::Switch).
     let mut active_idx = audio_idx;
     let mut ts = open_track(&ictx, active_idx, out_channels, out_sample_rate)?;

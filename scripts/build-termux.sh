@@ -42,7 +42,9 @@ fi
 # ---------------------------------------------------------------- deps --
 say "Instalando dependencias de build (pkg)"
 # binutils: ar/ranlib para las crates *-sys. libdav1d = decode AV1 decente.
-pkg install -y rust clang make pkg-config binutils curl tar xz-utils libdav1d
+# libgnutls: TLS para el protocolo https de libavformat (reproducción
+# por red / yt-dlp). LGPLv2.1+, misma licencia que el resto del build.
+pkg install -y rust clang make pkg-config binutils curl tar xz-utils libdav1d libgnutls
 
 # nasm solo hace falta para el asm x86 (termux-docker x86_64 del CI; en un
 # móvil aarch64 el asm NEON se ensambla con clang, sin nasm). Si no se
@@ -80,7 +82,9 @@ else
         --disable-encoders --disable-muxers \
         --disable-xlib --disable-libxcb \
         --disable-vulkan \
-        --enable-libdav1d $X86ASM_FLAG
+        --enable-libdav1d --enable-gnutls $X86ASM_FLAG
+    # https compilado o nada: sin TLS no hay reproducción por red.
+    grep -q "CONFIG_HTTPS_PROTOCOL 1" config_components.h
     make -j"$NPROC"
     make install
     cp COPYING.LGPLv2.1 "$FF_PREFIX/LICENSE.txt" 2>/dev/null || true

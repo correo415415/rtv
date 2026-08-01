@@ -568,3 +568,59 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
     [x] El usuario prefiere CI reproducible: Cargo.lock re-trackeado,
         quitado de .gitignore y restaurado --locked en build.yml (x4) y
         scripts/build-termux.sh. Validado cargo build --release --locked.
+
+## Reproducción por internet — Fase 1 + base de doble input (2026-08-01)
+
+    Plan acordado:
+      Fase 1 (esto): URLs http/https directas — libavformat ya trae los
+        protocolos de red, solo faltaba la capa TLS en nuestros builds.
+        + integración yt-dlp para sitios de vídeo (YouTube/Twitch/
+        Vimeo/Dailymotion autodetectados; --ytdl fuerza cualquier otro).
+      Fase 2 (pendiente): doble input ACTIVO por defecto (streams DASH
+        separados >720p de YouTube). La base ya queda puesta.
+
+    [x] src/source.rs: resolución de entrada (local | URL directa |
+        sitio → yt-dlp). MediaSource { video, audio: Option, title }.
+        open() central con opciones de red (reconnect, rw_timeout 15 s)
+        vía input_with_dictionary; TODOS los demuxers (decoder, audio,
+        subs, tracks, info) abren por source::open — un solo sitio para
+        el futuro. 7 unit tests (31/31 total).
+    [x] yt-dlp: NO embebido. Licencia Unlicense (dominio público) ⇒
+        embeberlo sería LEGAL, pero es Python: zipapp ~3 MB + python3
+        del sistema o PyInstaller ~30 MB/plataforma, y quedaría
+        congelado (YouTube rompe extractores cada pocas semanas; el
+        yt-dlp del sistema se actualiza con pip/pkg/winget). Se busca
+        en $RTV_YTDLP y PATH; error claro si falta. Formato default
+        "b" (muxed, 1 URL); --ytdl-format permite "bv*+ba/b" (2 URLs).
+    [x] Base doble input: player::Config.audio_path — el pipeline de
+        audio (que YA abre su propio demuxer) recibe la URL de audio
+        separada; tracks::probe sondea audio del fichero de audio y
+        subs del de vídeo. Si yt-dlp devuelve 2 URLs se enchufa solo
+        (experimental, aviso en stderr).
+    [x] TLS en los builds de CI:
+        * Linux: --enable-gnutls (LGPLv2.1+, mantiene licencia del
+          build; openssl exigiría --enable-version3) + libgnutls28-dev
+          + cadena gnutls verificada en el cierre ldd del paquete.
+        * macOS: --enable-securetransport (TLS del sistema, nada que
+          empaquetar).
+        * Windows: nada que hacer — BtbN compila con --enable-schannel
+          (verificado en su scripts.d/50-schannel.sh).
+        * Termux: pkg libgnutls + --enable-gnutls en build-termux.sh
+          (el bundler ya recoge la cadena transitiva; el test de
+          contenedor limpio valida que no falte ninguna).
+        * Los 3 builds propios: grep CONFIG_HTTPS_PROTOCOL 1 en
+          config_components.h (¡NO config.h! — en FFmpeg 7.x los
+          defines de componentes viven ahí; pillado en local).
+        * Smoke de RED en CI (linux + termux): http.server local →
+          rtv --info + reproducción completa en pty por http.
+    [x] Validado en local (FFmpeg 7.1.5 recompilado con gnutls):
+        31/31 tests, -Dwarnings limpio (default y pulse), --info y
+        reproducción completa por http y https locales, --info de URL
+        https REAL de internet (test-videos.co.uk, TLS ok) +
+        reproducción completa hasta EOF, resolución yt-dlp ok
+        (YouTube bloquea la IP del sandbox — "Sign in to confirm";
+        en máquina de usuario funciona).
+    Notas: python http.server no soporta Range → los fixtures mp4 de
+        red llevan -movflags +faststart (moov delante). El “Ruta:” de
+        --info se omite para URLs (la del CDN mide >1 KB); “Nombre:”
+        es el título de yt-dlp o la URL tecleada.
