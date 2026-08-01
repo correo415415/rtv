@@ -55,6 +55,10 @@ pub enum SubMode {
 
 pub struct Config {
     pub path: PathBuf,
+    /// Entrada SEPARADA solo-audio (doble input: streams DASH partidos
+    /// de yt-dlp). El pipeline de audio —que ya usa su propio demuxer—
+    /// abre esta URL en vez de `path`. None = audio dentro de `path`.
+    pub audio_path: Option<PathBuf>,
     pub forced_backend: Option<String>,
     pub scale: f32,
     pub loop_video: bool,
@@ -223,7 +227,18 @@ pub fn run(cfg: Config) -> Result<()> {
     let vidclk = FfClock::new();
 
     // --- Inventario de pistas del contenedor (audio + subs texto) ---
-    let (audio_tracks, sub_tracks) = tracks::probe(&cfg.path);
+    // Con doble input las pistas de AUDIO viven en el fichero/URL de
+    // audio y las de subtítulos en el de vídeo; con input único todo
+    // sale del mismo sondeo.
+    let audio_media: &PathBuf = cfg.audio_path.as_ref().unwrap_or(&cfg.path);
+    let (audio_tracks, sub_tracks) = match &cfg.audio_path {
+        None => tracks::probe(&cfg.path),
+        Some(ap) => {
+            let (at, _) = tracks::probe(ap);
+            let (_, st) = tracks::probe(&cfg.path);
+            (at, st)
+        }
+    };
 
     // --- Audio (opcional) ---
     // Pista inicial: --aid (1-based) / --alang, con fallback a la
@@ -236,7 +251,7 @@ pub fn run(cfg: Config) -> Result<()> {
         None
     } else {
         match audio::spawn(
-            &cfg.path,
+            audio_media,
             audclk_pre.clone(),
             start_audio_stream,
             cfg.audio_backend,

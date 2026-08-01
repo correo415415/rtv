@@ -57,7 +57,7 @@ pub fn is_text_sub_codec(id: ffmpeg::codec::Id) -> bool {
 pub fn probe(path: &Path) -> (Vec<TrackInfo>, Vec<TrackInfo>) {
     let mut audio = Vec::new();
     let mut subs = Vec::new();
-    let Ok(ictx) = ffmpeg::format::input(path) else {
+    let Ok(ictx) = crate::source::open(path) else {
         return (audio, subs);
     };
     for stream in ictx.streams() {

@@ -308,7 +308,7 @@ fn ass_payload_text(s: &str) -> String {
 fn load_embedded(media: &Path, want_index: Option<usize>) -> Option<SubTrack> {
     // Sondeo rápido: ¿hay stream de subtítulos de TEXTO? (los bitmap
     // — dvdsub/pgs — no se pueden renderizar como texto; se ignoran).
-    let ictx = ffmpeg::format::input(media).ok()?;
+    let ictx = crate::source::open(media).ok()?;
     let stream = match want_index {
         Some(i) => {
             let s = ictx.stream(i)?;
@@ -356,7 +356,7 @@ fn load_embedded(media: &Path, want_index: Option<usize>) -> Option<SubTrack> {
 }
 
 fn decode_embedded(media: &Path, sidx: usize, out: &Mutex<Vec<SubEvent>>) -> Result<()> {
-    let mut ictx = ffmpeg::format::input(media)?;
+    let mut ictx = crate::source::open(media)?;
 
     // AVDISCARD_ALL en todos los streams menos el de subtítulos: el
     // demuxer usa el índice del contenedor y NO lee los paquetes de

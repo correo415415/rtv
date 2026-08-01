@@ -49,7 +49,7 @@ use crate::hwdec::{self, ActiveHw, HwPref};
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use ffmpeg_the_third as ffmpeg;
-use ffmpeg::format::{input, Pixel};
+use ffmpeg::format::Pixel;
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as SwsCtx, flag::Flags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
@@ -333,7 +333,7 @@ pub fn spawn<P: AsRef<Path>>(
     hw_pref: HwPref,
 ) -> Result<DecoderHandle> {
     let path = path.as_ref().to_owned();
-    let ictx = input(&path).with_context(|| format!("abriendo {:?}", path))?;
+    let ictx = crate::source::open(&path).with_context(|| format!("abriendo {:?}", path))?;
 
     let stream = ictx
         .streams()
@@ -512,7 +512,7 @@ fn decode_loop(
     eof: Arc<AtomicBool>,
     serial_atomic: Arc<AtomicI32>,
 ) -> Result<()> {
-    let mut ictx = input(&path)?;
+    let mut ictx = crate::source::open(&path)?;
     let time_base = ictx
         .stream(video_idx)
         .ok_or_else(|| anyhow!("stream desapareció"))?

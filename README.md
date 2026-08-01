@@ -185,8 +185,25 @@ para x86_64 y aarch64, y publica paquetes `rtv-*-termux-*` como artefactos
 ## Uso
 
 ```
-rtv <fichero> [opciones]
+rtv <fichero|URL> [opciones]
 ```
+
+La entrada puede ser un fichero local, una **URL http/https directa**
+(mp4, mkv, HLS `.m3u8`… — los protocolos de red van integrados en el
+FFmpeg empaquetado, TLS incluido) o la **página de un sitio de vídeo**
+(YouTube, Twitch, Vimeo, Dailymotion) si tienes
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) instalado:
+
+```bash
+rtv https://ejemplo.com/video.mp4                # URL directa
+rtv https://www.youtube.com/watch?v=aqz-KE-bpKQ  # vía yt-dlp
+rtv --ytdl https://cualquier-sitio-que-yt-dlp-soporte/…
+```
+
+yt-dlp se instala con `pip install yt-dlp` (Termux: igual, tras
+`pkg install python-pip`), `winget install yt-dlp` en Windows o
+`brew install yt-dlp` en macOS. rtv lo busca en el `PATH` (o en
+`$RTV_YTDLP` si quieres apuntar a un ejecutable concreto).
 
 | Opción | Efecto |
 |---|---|
@@ -202,6 +219,8 @@ rtv <fichero> [opciones]
 | `--aid <N>` / `--alang <idioma>` | Pista de audio inicial: por índice 1-based dentro de las pistas de audio (`--aid 2` = segunda) o por idioma (`--alang spa`), como mpv. Sin match → pista "best" de FFmpeg |
 | `--sid <N>` / `--slang <idioma>` | Pista de subtítulos embebida inicial (por índice de pista de texto / por idioma). Implican subtítulos ON aunque no se pase `--sub` |
 | `--hwdec <auto\|none\|vaapi\|cuda\|qsv\|d3d11va\|dxva2\|videotoolbox\|vulkan\|drm\|vdpau>` | Decode por hardware. `auto` (default) prueba los hwaccels de la plataforma y cae a software si ninguno funciona; `none` fuerza software |
+| `--ytdl` | Fuerza la resolución con yt-dlp para CUALQUIER URL (los sitios grandes —YouTube, Twitch, Vimeo, Dailymotion— se detectan solos, sin flag) |
+| `--ytdl-format <FMT>` | Formato que se pide a yt-dlp (su sintaxis `-f`). Default `b` = mejor formato muxed (una URL, hasta ~720p en YouTube). Experimental: `"bv*+ba/b"` pide vídeo+audio en streams DASH separados (doble input) |
 | `--verbose` | Deja los logs de FFmpeg en stderr (debugging) y lista los hwaccels compilados |
 
 ### Decode por hardware (`--hwdec`)
