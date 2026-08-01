@@ -16,6 +16,7 @@ mod audio_backend;
 mod clock;
 mod decoder;
 mod hwdec;
+mod info;
 mod input;
 mod player;
 mod renderer;
@@ -32,6 +33,11 @@ use std::path::PathBuf;
 struct Cli {
     /// Ruta al fichero de vídeo
     path: PathBuf,
+
+    /// NO reproducir: mostrar información del fichero (formato,
+    /// duración, calidad, pistas de audio/subtítulos, capítulos…).
+    #[arg(long)]
+    info: bool,
 
     /// Forzar backend de render: kitty | iterm2 | sixel | blocks | ascii
     #[arg(long)]
@@ -122,16 +128,31 @@ fn main() -> Result<()> {
 
     // Silenciar libav antes de tocar nada. Ver comentarios largos en el
     // repositorio para el razonamiento (tres capas de log).
+    // Con --info NO se redirige stderr: el proceso no pinta en el
+    // terminal y el usuario debe VER "no se pudo abrir ..." si falla
+    // (solo se acallan los logs internos de libav).
     if !cli.verbose {
         ffmpeg_the_third::util::log::set_level(ffmpeg_the_third::util::log::Level::Quiet);
         unsafe {
             ffmpeg_the_third::sys::av_log_set_level(ffmpeg_the_third::sys::AV_LOG_QUIET);
             ffmpeg_the_third::sys::av_log_set_callback(None);
         }
-        silence_stderr();
+        if !cli.info {
+            silence_stderr();
+        }
     }
 
     ffmpeg_the_third::init()?;
+
+    // --info: inspección sin reproducción. Sale antes de tocar el
+    // terminal (ni raw mode ni alt screen): la salida es pipeable.
+    if cli.info {
+        if let Err(e) = info::print_info(&cli.path) {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     if cli.verbose {
         eprintln!("hwaccels disponibles: {:?}", hwdec::available_types());
