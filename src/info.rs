@@ -247,10 +247,12 @@ fn pix_fmt_name(format: i32) -> Option<String> {
 /// "N canales".
 fn channel_desc(layout: &ffmpeg::sys::AVChannelLayout, nch: i32) -> String {
     let mut buf = [0u8; 64];
+    // Cast vía c_char: en x86 c_char = i8 pero en ARM/aarch64 = u8 —
+    // un cast a *mut i8 rompía las builds arm de Linux y Termux.
     let n = unsafe {
         ffmpeg::sys::av_channel_layout_describe(
             layout,
-            buf.as_mut_ptr() as *mut i8,
+            buf.as_mut_ptr() as *mut std::os::raw::c_char,
             buf.len(),
         )
     };
