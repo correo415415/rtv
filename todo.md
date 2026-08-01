@@ -562,3 +562,9 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
     [x] Último warning de Windows: `unused import: Read` en terminfo.rs:22
         — Read solo lo usa el sondeo unix; ahora `#[cfg(unix)] use
         std::io::Read;`. Validado -Dwarnings en default y pulse.
+
+## Revert: Cargo.lock vuelve al repo (2026-08-01)
+
+    [x] El usuario prefiere CI reproducible: Cargo.lock re-trackeado,
+        quitado de .gitignore y restaurado --locked en build.yml (x4) y
+        scripts/build-termux.sh. Validado cargo build --release --locked.
