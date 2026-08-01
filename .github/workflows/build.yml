@@ -133,12 +133,12 @@ jobs:
         run: |
           echo "FFMPEG_DIR=$HOME/ffmpeg" >> "$GITHUB_ENV"
           export FFMPEG_DIR="$HOME/ffmpeg"
-          cargo build --release --locked
+          cargo build --release
 
       - name: Tests unitarios
         env:
           LD_LIBRARY_PATH: ${{ env.FFMPEG_DIR }}/lib
-        run: cargo test --release --locked
+        run: cargo test --release
 
       - name: Empaquetar (binario + cierre de libs no-sistema, RPATH $ORIGIN)
         id: pkg
@@ -238,7 +238,7 @@ jobs:
           "LIBCLANG_PATH=C:\llvm18\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Compilar
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Empaquetar (rtv.exe + DLLs de FFmpeg)
         id: pkg
@@ -340,7 +340,7 @@ jobs:
       - name: Compilar rtv
         run: |
           export FFMPEG_DIR="$HOME/ffmpeg"
-          cargo build --release --locked
+          cargo build --release
 
       - name: Empaquetar (dylibs con @executable_path + firma ad-hoc)
         id: pkg

@@ -544,3 +544,21 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
         default y pulse): eliminados los accessors muertos
         MasterClock::{audclk,vidclk} (clock.rs) y el import sin usar
         `Instant` de examples/cpal_rate.rs. 22/22 tests.
+
+## Pulido --info + Cargo.lock + warning Windows (2026-08-01)
+
+    [x] Metadatos del contenedor legibles: pretty_date() ("20240423" →
+        "2024-04-23"; ISO 8601 → "2024-04-23 10:31:02 UTC") y
+        pretty_brands() ("isomiso2avc1mp41" → "isom, iso2, avc1, mp41").
+        Columna alineada dinámicamente al label más largo (antes
+        compatible_brands rompía el padding fijo). Claves comparadas en
+        minúsculas (Matroska las guarda como "ENCODER"). Nuevas etiquetas:
+        Brands / Brand / Versión menor. +2 unit tests (24/24).
+    [x] Cargo.lock añadido a .gitignore y des-trackeado (git rm --cached).
+        Consecuencia: eliminado --locked de build.yml (x4) y de
+        scripts/build-termux.sh — sin lockfile commiteado cargo --locked
+        falla. Tradeoff: los builds de CI resuelven deps al vuelo (menos
+        reproducibles); para un binario es lo que pidió el usuario.
+    [x] Último warning de Windows: `unused import: Read` en terminfo.rs:22
+        — Read solo lo usa el sondeo unix; ahora `#[cfg(unix)] use
+        std::io::Read;`. Validado -Dwarnings en default y pulse.
