@@ -494,6 +494,24 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
     Además: release desde build.yml vía workflow_dispatch con inputs
     release_tag / release_message (Markdown, \n = salto de línea) /
     prerelease; tabla de descargas ampliada con los paquetes termux.
+
+## Fix post-release (sesión 2026-08-01): lib faltante en dispositivo real
+
+    Usuario en su Android: "falta una librería" al ejecutar el paquete.
+    Causa: el paquete termux solo llevaba las libs de rtv-ffmpeg/lib, pero
+    ese FFmpeg enlaza libdav1d del pkg de Termux (instalado por el build
+    script) -> en un móvil sin `pkg install libdav1d` el linker falla. El
+    CI no lo veía porque testeaba en el MISMO contenedor del build.
+    [x] ci/termux_bundle_libs.py: cierre transitivo de NEEDED (readelf)
+        ejecutado dentro del userland; copia todo lo de rtv-ffmpeg/lib y
+        $PREFIX/lib; lista blanca de libs bionic (/system) y error si algo
+        no cuadra. Sanity en el workflow: 5 familias FFmpeg + libdav1d.
+    [x] build.yml: nuevo paso "Test de instalación LIMPIA" — contenedor
+        termux RECIÉN creado (sin deps de build, sin pulseaudio), se copia
+        solo el tar.gz: rtv --version (el linker carga todas las NEEDED) +
+        smoke pty con backend auto degradando limpio sin servidor pulse.
+    Workaround inmediato para el usuario mientras tanto:
+    pkg install libdav1d
     termux_audio_check con pulse: 301 callbacks, PTS max 5.912 s,
     monotonía 100%. auto: OK. Simulación TERMUX_VERSION → auto elige
     pulse. --audio-backend patata → exit 2. El flujo del contenedor se

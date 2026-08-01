@@ -506,7 +506,7 @@ jobs:
             echo "esperaba exit 2, obtuve $code"; exit 1
           fi
 
-      - name: Empaquetar (rtv + FFmpeg 7.1 autocontenido)
+      - name: Empaquetar (rtv + cierre COMPLETO de libs, autocontenido)
         id: pkg
         run: |
           set -euo pipefail
@@ -514,12 +514,20 @@ jobs:
           elif [[ -n "${{ inputs.release_tag }}" ]]; then ver="${{ inputs.release_tag }}"
           else ver="${GITHUB_SHA::7}"; fi
           P=rtv-${ver}-termux-${{ matrix.arch }}
-          mkdir -p "$P/libs"
+          mkdir -p "$P"
           docker cp tx:$TXH/rtv/target/release/rtv "$P/rtv.bin"
-          docker cp tx:$TXH/rtv-ffmpeg/lib "$P/ffmpeg-lib"
-          # Solo las shared libs (sin pkgconfig ni headers).
-          mv "$P"/ffmpeg-lib/*.so* "$P/libs/" 2>/dev/null || true
-          rm -rf "$P/ffmpeg-lib"
+          # Cierre TRANSITIVO de dependencias calculado DENTRO del userland
+          # Termux: FFmpeg propio + todo lo que venga de $PREFIX/lib (p.ej.
+          # libdav1d del pkg — antes NO se empaquetaba y en un móvil sin
+          # `pkg install libdav1d` el linker fallaba con "library not
+          # found"). Solo quedan fuera las libs bionic de /system.
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx sh -c \
+            'python3 ci/termux_bundle_libs.py target/release/rtv $HOME/bundle-libs $HOME/rtv-ffmpeg/lib $PREFIX/lib'
+          docker cp tx:$TXH/bundle-libs "$P/libs"
+          # Sanity: las 5 familias de FFmpeg + libdav1d tienen que estar.
+          for lib in libavutil libavcodec libavformat libswscale libswresample libdav1d; do
+            ls "$P/libs/$lib"*.so* >/dev/null || { echo "FALTA $lib en el paquete"; exit 1; }
+          done
           docker cp tx:$TXH/rtv-ffmpeg/LICENSE.txt "$P/LICENSE-FFmpeg.txt" || true
           # Lanzador relativo: funciona desde cualquier ruta de Termux.
           cat > "$P/rtv" << 'WRAP'
@@ -541,6 +549,36 @@ jobs:
           DOC
           tar -czf "$P.tar.gz" "$P"
           echo "pkg=$P" >> "$GITHUB_OUTPUT"
+
+      # Reproduce EXACTAMENTE la situación de un usuario: contenedor Termux
+      # RECIÉN creado (sin las deps que instaló el build: ni libdav1d, ni
+      # rust, ni pulseaudio) al que solo se copia el tar.gz de la release.
+      # Si al paquete le falta cualquier librería, `rtv --version` revienta
+      # aquí con "library ... not found" ANTES de publicar nada.
+      - name: Test de instalación LIMPIA (contenedor sin deps de build)
+        run: |
+          set -euo pipefail
+          P="${{ steps.pkg.outputs.pkg }}"
+          docker run -d --name clean --security-opt seccomp=unconfined \
+            termux/termux-docker:${{ matrix.arch }} sleep infinity
+          docker cp "$P.tar.gz" clean:$TXH/
+          # Fixture generado en el contenedor de build (instalar ffmpeg aquí
+          # arrastraría libdav1d y enmascararía justo lo que testeamos).
+          docker cp tx:$TXH/smoke.mp4 /tmp/smoke.mp4
+          docker cp /tmp/smoke.mp4 clean:$TXH/smoke.mp4
+          docker cp ci/smoke_pty.py clean:$TXH/smoke_pty.py
+          docker exec -u 0 clean chown -R 1000:1000 $TXH
+          docker exec -u 1000 -e HOME=$TXH -w $TXH clean sh -c "tar -xzf $P.tar.gz"
+          # 1) El linker carga TODAS las NEEDED al arrancar: si falta una
+          #    lib, esto falla ya (el bug del dispositivo real).
+          docker exec -u 1000 -e HOME=$TXH clean $TXH/$P/rtv --version
+          # 2) Reproducción real en pty. Solo se instala python (no trae
+          #    libs multimedia). Sin pulseaudio: `auto` debe degradar
+          #    limpio a vídeo sin audio, como en un móvil recién instalado.
+          docker exec -u 1000 -e HOME=$TXH clean pkg install -y python
+          docker exec -u 1000 -e HOME=$TXH -w $TXH clean \
+            python3 smoke_pty.py $TXH/$P/rtv smoke.mp4
+          docker rm -f clean
 
       - uses: actions/upload-artifact@v7
         with:
