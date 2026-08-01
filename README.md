@@ -200,10 +200,22 @@ rtv https://www.youtube.com/watch?v=aqz-KE-bpKQ  # vía yt-dlp
 rtv --ytdl https://cualquier-sitio-que-yt-dlp-soporte/…
 ```
 
-yt-dlp se instala con `pip install yt-dlp` (Termux: igual, tras
-`pkg install python-pip`), `winget install yt-dlp` en Windows o
-`brew install yt-dlp` en macOS. rtv lo busca en el `PATH` (o en
-`$RTV_YTDLP` si quieres apuntar a un ejecutable concreto).
+**Los paquetes de release de Linux/Windows/macOS ya incluyen yt-dlp**
+(el standalone oficial, junto al binario de rtv): funciona nada más
+descomprimir. rtv busca por este orden: `$RTV_YTDLP` → `yt-dlp` del
+`PATH` (si instalaste uno con pip/winget/brew, se prefiere por ser más
+actualizable) → el incluido en el paquete. El incluido se actualiza
+solo con `yt-dlp -U`. En Termux no existe build de yt-dlp para Android:
+`pkg install python-pip && pip install yt-dlp`.
+
+Con YouTube, el default pide **vídeo hasta 1080p + audio en streams
+DASH separados** (doble input: dos conexiones, una por demuxer, audio
+de reloj maestro) con fallback a muxed. `--ytdl-format b` fuerza una
+sola conexión. También puedes montar tú el doble input a mano:
+
+```bash
+rtv película.mkv --audio-file comentario_del_director.m4a
+```
 
 | Opción | Efecto |
 |---|---|
@@ -220,7 +232,8 @@ yt-dlp se instala con `pip install yt-dlp` (Termux: igual, tras
 | `--sid <N>` / `--slang <idioma>` | Pista de subtítulos embebida inicial (por índice de pista de texto / por idioma). Implican subtítulos ON aunque no se pase `--sub` |
 | `--hwdec <auto\|none\|vaapi\|cuda\|qsv\|d3d11va\|dxva2\|videotoolbox\|vulkan\|drm\|vdpau>` | Decode por hardware. `auto` (default) prueba los hwaccels de la plataforma y cae a software si ninguno funciona; `none` fuerza software |
 | `--ytdl` | Fuerza la resolución con yt-dlp para CUALQUIER URL (los sitios grandes —YouTube, Twitch, Vimeo, Dailymotion— se detectan solos, sin flag) |
-| `--ytdl-format <FMT>` | Formato que se pide a yt-dlp (su sintaxis `-f`). Default `b` = mejor formato muxed (una URL, hasta ~720p en YouTube). Experimental: `"bv*+ba/b"` pide vídeo+audio en streams DASH separados (doble input) |
+| `--ytdl-format <FMT>` | Formato que se pide a yt-dlp (su sintaxis `-f`). Default `bv*[height<=?1080]+ba/b`: mejor vídeo ≤1080p + mejor audio en streams separados (doble input), con fallback a muxed. `b` fuerza muxed (una sola conexión) |
+| `--audio-file <fichero\|URL>` | Reproduce el AUDIO desde otro fichero/URL (doble input), como el `--audio-file` de mpv. Prioridad sobre el audio separado de yt-dlp |
 | `--verbose` | Deja los logs de FFmpeg en stderr (debugging) y lista los hwaccels compilados |
 
 ### Decode por hardware (`--hwdec`)

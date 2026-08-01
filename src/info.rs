@@ -19,12 +19,18 @@ use std::path::Path;
 /// Punto de entrada de `--info`. Imprime a stdout y devuelve error solo
 /// si el fichero no se puede abrir/demuxear. `display` sustituye al
 /// nombre derivado de la ruta (para URLs: título de yt-dlp o la URL que
-/// escribió el usuario, no la del CDN).
-pub fn print_info(path: &Path, display: Option<&str>) -> Result<()> {
+/// escribió el usuario, no la del CDN). `audio` es el input SEPARADO
+/// solo-audio del doble input (yt-dlp DASH / --audio-file), si lo hay.
+pub fn print_info(path: &Path, audio: Option<&Path>, display: Option<&str>) -> Result<()> {
     let ictx = crate::source::open(path)
         .with_context(|| format!("no se pudo abrir {}", path.display()))?;
+    // El input de audio separado se sondea aparte; si falla no tumba el
+    // informe del vídeo (se anota el error).
+    let audio_ictx = audio.map(|a| {
+        crate::source::open(a).map_err(|e| anyhow::anyhow!("{}: {e}", a.display()))
+    });
     let color = std::io::stdout().is_terminal();
-    print!("{}", render(path, &ictx, color, display));
+    print!("{}", render(path, &ictx, color, display, audio_ictx.as_ref()));
     Ok(())
 }
 
@@ -35,6 +41,7 @@ fn render(
     ictx: &ffmpeg::format::context::Input,
     color: bool,
     display: Option<&str>,
+    audio_input: Option<&Result<ffmpeg::format::context::Input, anyhow::Error>>,
 ) -> String {
     let mut o = String::new();
     let h = |s: &str| {
@@ -182,8 +189,9 @@ fn render(
         let _ = writeln!(o, "{line}{}", stream_tags(s));
     }
 
-    let _ = writeln!(o, "\n{}", h(&format!("Audio ({})", audios.len())));
-    for (i, s) in audios.iter().enumerate() {
+    // Con doble input (DASH separado / --audio-file) las pistas de
+    // audio viven en el OTRO input; el del vídeo normalmente no trae.
+    let audio_line = |o: &mut String, i: usize, s: &ffmpeg::format::stream::Stream| {
         let p = unsafe { &*s.parameters().as_ptr() };
         let codec = codec_name(s.parameters().id());
         let mut line = format!("  #{} {}", i + 1, b(&codec));
@@ -198,6 +206,32 @@ fn render(
             let _ = write!(line, "  {}", human_bitrate(p.bit_rate));
         }
         let _ = writeln!(o, "{line}{}", stream_tags(s));
+    };
+    match audio_input {
+        None => {
+            let _ = writeln!(o, "\n{}", h(&format!("Audio ({})", audios.len())));
+            for (i, s) in audios.iter().enumerate() {
+                audio_line(&mut o, i, s);
+            }
+        }
+        Some(Ok(actx)) => {
+            let ext: Vec<_> = actx
+                .streams()
+                .filter(|s| s.parameters().medium() == Type::Audio)
+                .collect();
+            let _ = writeln!(
+                o,
+                "\n{}",
+                h(&format!("Audio ({}) — input separado", ext.len()))
+            );
+            for (i, s) in ext.iter().enumerate() {
+                audio_line(&mut o, i, s);
+            }
+        }
+        Some(Err(e)) => {
+            let _ = writeln!(o, "\n{}", h("Audio — input separado"));
+            let _ = writeln!(o, "  (no se pudo abrir: {e})");
+        }
     }
 
     let _ = writeln!(o, "\n{}", h(&format!("Subtítulos ({})", subs.len())));
