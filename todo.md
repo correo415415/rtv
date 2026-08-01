@@ -516,3 +516,20 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
     monotonía 100%. auto: OK. Simulación TERMUX_VERSION → auto elige
     pulse. --audio-backend patata → exit 2. El flujo del contenedor se
     valida con el propio workflow en Actions (el sandbox no tiene docker).
+
+# ✅ HECHO (sesión 2026-08-01): --info
+
+    rtv --info <fichero>: NO reproduce; imprime Fichero (nombre, ruta,
+    tamaño humano, mtime UTC), Contenedor (formato, duración, bitrate,
+    metadatos con título/fecha primero), Vídeo (codec, WxH + etiqueta
+    1080p/4K…, fps, pix_fmt, bitrate), TODAS las pistas de Audio (codec,
+    layout stereo/5.1 via av_channel_layout_describe, Hz, bitrate,
+    idioma/título/[default]/[forced]) y Subtítulos (texto vs bitmap no
+    renderizable), y Capítulos (máx 30). Solo demux de cabeceras:
+    instantáneo. ANSI solo si stdout es TTY (pipeable). Con --info no se
+    silencia stderr (los errores de apertura deben verse; exit 1).
+    Nuevo src/info.rs + 4 unit tests (etiquetas de calidad, tamaños,
+    duraciones, fechas epoch→civil). Validado: 22/22 tests, smoke pty OK,
+    MP4 (2 audios spa/eng + mov_text) y MKV (título de pista, ac3 stereo).
+    Nota: MP4 descarta el title por pista al muxear (verificado con
+    ffprobe) — en MKV sí se muestra.

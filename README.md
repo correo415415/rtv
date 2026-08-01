@@ -190,6 +190,7 @@ rtv <fichero> [opciones]
 
 | Opción | Efecto |
 |---|---|
+| `--info` | NO reproduce: imprime la información del fichero — nombre, tamaño, fecha, formato, duración, bitrate, metadatos, pista de vídeo (codec, resolución + calidad `1080p/4K…`, fps), todas las pistas de audio (codec, canales, Hz, idioma) y de subtítulos (idioma, texto/bitmap), y capítulos. Salida pipeable (sin ANSI si stdout no es un terminal) |
 | `--backend <kitty\|iterm2\|sixel\|blocks\|ascii>` | Fuerza un backend (por defecto se auto-detecta) |
 | `--scale <0.1..1.0>` | Limita la resolución de render. Útil en terminales 4K donde el decode software no da abasto |
 | `--loop-video` | Reinicia al llegar al final |
