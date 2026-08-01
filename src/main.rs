@@ -108,11 +108,21 @@ struct Cli {
     ytdl: bool,
 
     /// Formato que se pide a yt-dlp (sintaxis de su opción -f). El
-    /// default "b" pide el mejor formato muxed (una sola URL).
-    /// Experimental: "bv*+ba/b" pide vídeo+audio en streams separados
-    /// (doble input).
-    #[arg(long, default_value = "b", value_name = "FMT")]
+    /// default pide el mejor vídeo hasta 1080p + mejor audio en streams
+    /// separados (doble input), con fallback al mejor formato muxed.
+    /// "b" fuerza muxed (una sola conexión, hasta ~720p en YouTube).
+    #[arg(
+        long,
+        default_value = "bv*[height<=?1080]+ba/b",
+        value_name = "FMT"
+    )]
     ytdl_format: String,
+
+    /// Reproducir el AUDIO desde otro fichero/URL (doble input), como
+    /// el --audio-file de mpv. Tiene prioridad sobre el audio separado
+    /// que devuelva yt-dlp.
+    #[arg(long, value_name = "FICHERO|URL")]
+    audio_file: Option<String>,
 
     /// Dejar que FFmpeg y sus codecs escriban a stderr (útil para depurar).
     #[arg(long)]
@@ -143,13 +153,17 @@ fn main() -> Result<()> {
     // Resolver la entrada ANTES de silenciar stderr: yt-dlp puede tardar
     // y fallar, y sus errores deben verse. Para rutas locales y URLs
     // directas esto no ejecuta nada (solo clasifica el argumento).
-    let src = match source::resolve(&cli.path, cli.ytdl, &cli.ytdl_format) {
+    let mut src = match source::resolve(&cli.path, cli.ytdl, &cli.ytdl_format) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e:#}");
             std::process::exit(1);
         }
     };
+    // --audio-file manda sobre el audio separado de yt-dlp.
+    if let Some(af) = &cli.audio_file {
+        src.audio = Some(PathBuf::from(af));
+    }
 
     // Silenciar libav antes de tocar nada. Ver comentarios largos en el
     // repositorio para el razonamiento (tres capas de log).
@@ -179,7 +193,7 @@ fn main() -> Result<()> {
         } else {
             None
         };
-        if let Err(e) = info::print_info(&src.video, display) {
+        if let Err(e) = info::print_info(&src.video, src.audio.as_deref(), display) {
             eprintln!("error: {e:#}");
             std::process::exit(1);
         }

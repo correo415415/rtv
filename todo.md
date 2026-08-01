@@ -624,3 +624,42 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
         red llevan -movflags +faststart (moov delante). El “Ruta:” de
         --info se omite para URLs (la del CDN mide >1 KB); “Nombre:”
         es el título de yt-dlp o la URL tecleada.
+
+## Fase 2: doble input activo + yt-dlp en las releases (2026-08-01)
+
+    [x] Doble input ACTIVO por defecto con yt-dlp: --ytdl-format default
+        pasa de "b" a "bv*[height<=?1080]+ba/b" (mejor vídeo ≤1080p +
+        mejor audio en streams DASH separados, fallback a muxed). El
+        pipeline de audio abre su URL con su propio demuxer; audio =
+        reloj maestro; el seek va a los dos demuxers (ya era así por
+        arquitectura).
+    [x] --audio-file <fichero|URL>: doble input manual, como el
+        --audio-file de mpv (prioridad sobre el audio de yt-dlp).
+        Sirve además para testear el doble input sin YouTube.
+    [x] --info con doble input: sondea el input de audio separado y lo
+        lista como "Audio (N) — input separado"; si no se puede abrir,
+        lo anota sin tumbar el informe del vídeo.
+    [x] yt-dlp EN LAS RELEASES (linux x86_64/arm64, windows, macos):
+        se empaqueta el standalone oficial (descarga en CI + sanity
+        --version en el runner). Orden de búsqueda de rtv:
+        $RTV_YTDLP → PATH (preferido: pip/winget lo actualizan) →
+        junto al ejecutable (fallback "funciona al descomprimir").
+        El standalone soporta self-update (yt-dlp -U) ⇒ no queda
+        congelado. Licencia OK: Unlicense (+ aviso PSF por el Python
+        embebido) → ci/LICENSE-yt-dlp.txt en cada paquete. Termux: NO
+        (no hay build bionic de yt-dlp) → pip install yt-dlp, documentado
+        en el README.txt del paquete. Coste: ~+30 MB por paquete.
+    [x] CI (job linux): test de DOBLE INPUT real — vídeo-solo y
+        audio-solo servidos por http + PulseAudio null-sink +
+        termux_audio_check (exige reloj de audio anclado y monótono)
+        + --info con "input separado" verificado por grep.
+    [x] Validado en local: 31/31 tests, -Dwarnings limpio (default y
+        pulse), doble input por http con audio real (301 callbacks,
+        PTS 5.92/6 s, monotonía 100%), SEEK con doble input (salto
+        3.82 s observado en el reloj de audio, salida limpia),
+        fallback del yt-dlp empaquetado (PATH sin yt-dlp → lo
+        encuentra junto al binario), formato default validado con
+        extracción real (archive.org), y los 4 assets de yt-dlp
+        (linux/aarch64/exe/macos) responden 200.
+    Nota: termux_audio_check parsea "pts_first=", no "pts=" (pillado
+        al escribir el test de seek ad-hoc).

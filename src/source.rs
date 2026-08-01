@@ -9,21 +9,26 @@
 //!     en `yt-dlp` (si está instalado) para convertirla en la URL
 //!     directa del stream, igual que hace mpv con su ytdl_hook.
 //!
-//! yt-dlp NO va embebido en el binario. Podría hacerse legalmente (su
-//! licencia es Unlicense, dominio público), pero es un programa Python:
-//! habría que incrustar el zipapp (~3 MB, exige python3 en el sistema)
-//! o el binario PyInstaller (~30 MB por plataforma) y quedaría
-//! CONGELADO: YouTube cambia cada pocas semanas y un yt-dlp desfasado
-//! deja de extraer. Un yt-dlp del sistema se actualiza solo
-//! (pip/pkg/winget). Se busca en $RTV_YTDLP y en el PATH.
+//! yt-dlp NO va compilado dentro del binario (es un programa Python; su
+//! licencia Unlicense lo permitiría, pero quedaría congelado y YouTube
+//! rompe extractores cada pocas semanas). En su lugar, las releases de
+//! rtv EMPAQUETAN el binario oficial standalone de yt-dlp junto a rtv
+//! (linux/windows/macos; en Termux no existe build bionic → pip). El
+//! orden de búsqueda favorece siempre al más actualizable:
+//!   1. $RTV_YTDLP (el usuario manda),
+//!   2. yt-dlp del PATH (pip/pkg/winget lo actualizan),
+//!   3. el yt-dlp empaquetado junto al ejecutable de rtv (fallback;
+//!      se auto-actualiza con `yt-dlp -U` — es el build PyInstaller
+//!      oficial, que soporta self-update).
 //!
-//! DOBLE INPUT (preparado, no activo por defecto): los formatos altos
-//! de YouTube son DASH con vídeo y audio en streams SEPARADOS. rtv ya
-//! usa un demuxer propio para vídeo (decoder.rs) y otro para audio
+//! DOBLE INPUT (activo por defecto con yt-dlp): los formatos altos de
+//! YouTube son DASH con vídeo y audio en streams SEPARADOS. rtv ya usa
+//! un demuxer propio para vídeo (decoder.rs) y otro para audio
 //! (audio.rs), así que reproducirlos solo requiere pasar la URL de
 //! audio al pipeline de audio: eso es `MediaSource::audio`, que
-//! player.rs ya enchufa. Con `--ytdl-format "bv*+ba/b"` se activa
-//! (experimental); el default "b" pide un formato muxed (una URL).
+//! player.rs enchufa (y `--audio-file` permite montarlo a mano, como
+//! mpv). El default de --ytdl-format pide "bv*[height<=?1080]+ba/b":
+//! mejor vídeo ≤1080p + mejor audio separados, fallback a muxed.
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use ffmpeg_the_third as ffmpeg;
@@ -124,13 +129,40 @@ pub fn open(media: &Path) -> Result<ffmpeg::format::context::Input, ffmpeg::Erro
 
 // ------------------------------------------------------------- yt-dlp --
 
-/// Localiza el ejecutable de yt-dlp: $RTV_YTDLP si está definido, si no
-/// "yt-dlp" del PATH (en Windows resuelve yt-dlp.exe solo).
+/// ¿Existe `name` como ejecutable en algún directorio del PATH?
+fn in_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let exe = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    std::env::split_paths(&paths).any(|d| !d.as_os_str().is_empty() && d.join(&exe).is_file())
+}
+
+/// Localiza el ejecutable de yt-dlp. Orden (del más fresco al fallback):
+/// $RTV_YTDLP → PATH → empaquetado junto al ejecutable de rtv.
 fn ytdlp_command() -> Command {
-    match std::env::var_os("RTV_YTDLP") {
-        Some(p) if !p.is_empty() => Command::new(p),
-        _ => Command::new("yt-dlp"),
+    if let Some(p) = std::env::var_os("RTV_YTDLP") {
+        if !p.is_empty() {
+            return Command::new(p);
+        }
     }
+    if in_path("yt-dlp") {
+        return Command::new("yt-dlp");
+    }
+    // ¿Viene empaquetado en la release, junto a rtv?
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
+            if cand.is_file() {
+                return Command::new(cand);
+            }
+        }
+    }
+    Command::new("yt-dlp") // fallará con el mensaje claro de abajo
 }
 
 /// Convierte una URL de página en URL(s) directas de stream con yt-dlp.
@@ -178,7 +210,7 @@ fn ytdl_resolve(url: &str, format: &str) -> Result<MediaSource> {
     if audio.is_some() {
         eprintln!(
             "[rtv] formato con vídeo y audio en streams separados \
-             (doble input, experimental)"
+             (doble input)"
         );
     }
     Ok(MediaSource {
