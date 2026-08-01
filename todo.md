@@ -533,3 +533,14 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
     MP4 (2 audios spa/eng + mov_text) y MKV (título de pista, ac3 stereo).
     Nota: MP4 descarta el title por pista al muxear (verificado con
     ffprobe) — en MKV sí se muestra.
+
+## Hotfix post-merge #29 (2026-08-01)
+
+    [x] Build rota en ARM (linux-arm64 + termux-aarch64): el cast
+        `buf.as_mut_ptr() as *mut i8` de av_channel_layout_describe —
+        c_char es i8 en x86 pero u8 en ARM. Fix: cast portable a
+        `*mut std::os::raw::c_char`.
+    [x] Warnings a cero (validado con RUSTFLAGS=-Dwarnings, features
+        default y pulse): eliminados los accessors muertos
+        MasterClock::{audclk,vidclk} (clock.rs) y el import sin usar
+        `Instant` de examples/cpal_rate.rs. 22/22 tests.

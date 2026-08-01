@@ -267,12 +267,6 @@ impl MasterClock {
             paused: AtomicU8::new(0),
         })
     }
-    pub fn audclk(&self) -> Option<&Arc<FfClock>> {
-        self.audclk.as_ref()
-    }
-    pub fn vidclk(&self) -> &Arc<FfClock> {
-        &self.vidclk
-    }
     /// Reloj “maestro” — audio si hay, video si no.
     pub fn master(&self) -> &Arc<FfClock> {
         self.audclk.as_ref().unwrap_or(&self.vidclk)
