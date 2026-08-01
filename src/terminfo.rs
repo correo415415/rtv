@@ -19,7 +19,11 @@
 //!   * **Se llama UNA sola vez al arrancar y se cachea**. Los resizes
 //!     reusan el mismo `CellPx`; no re-sondean.
 
-use std::io::{Read, Write};
+// `Read` solo lo usa el sondeo unix (poll de stdin byte a byte); en
+// Windows se lee con ReadConsoleInputW — importarlo allí es un warning.
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]

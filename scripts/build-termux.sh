@@ -94,7 +94,7 @@ say "Compilando rtv (backend de audio: pulse)"
 export FFMPEG_DIR="$FF_PREFIX"
 # bindgen necesita libclang; en Termux vive en $PREFIX/lib.
 export LIBCLANG_PATH="${LIBCLANG_PATH:-$PREFIX/lib}"
-cargo build --release --locked --no-default-features --features pulse
+cargo build --release --no-default-features --features pulse
 
 # Wrapper de conveniencia: rtv en el PATH con LD_LIBRARY_PATH puesto.
 say "Instalando wrapper en \$PREFIX/bin/rtv"

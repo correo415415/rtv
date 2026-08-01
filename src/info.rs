@@ -63,17 +63,24 @@ fn render(path: &Path, ictx: &ffmpeg::format::context::Input, color: bool) -> St
     }
 
     // ---------------------------------------------------- Contenedor --
+    // Se acumulan (etiqueta, valor) y se imprimen al final con la
+    // columna alineada al label más largo (compatible_brands rompía la
+    // alineación fija de 11 chars).
     let _ = writeln!(o, "\n{}", h("Contenedor"));
     let fmt = ictx.format();
-    let _ = writeln!(o, "  Formato:    {} ({})", fmt.name(), fmt.description());
+    let mut rows: Vec<(String, String)> = Vec::new();
+    rows.push((
+        "Formato".into(),
+        format!("{} ({})", fmt.name(), fmt.description()),
+    ));
     let dur_us = ictx.duration();
     if dur_us > 0 {
         let secs = dur_us as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
-        let _ = writeln!(o, "  Duración:   {}", fmt_duration(secs));
+        rows.push(("Duración".into(), fmt_duration(secs)));
     }
     let br = ictx.bit_rate();
     if br > 0 {
-        let _ = writeln!(o, "  Bitrate:    {}", human_bitrate(br));
+        rows.push(("Bitrate".into(), human_bitrate(br)));
     }
     // Metadatos del contenedor: título y fecha primero (lo que pide la
     // gente), luego el resto por orden alfabético.
@@ -82,29 +89,46 @@ fn render(path: &Path, ictx: &ffmpeg::format::context::Input, color: bool) -> St
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    // Matroska guarda las claves en mayúsculas ("ENCODER"); se comparan
+    // siempre en minúsculas para que el etiquetado no dependa del mux.
     kv.sort_by(|a, b2| {
-        let rank = |k: &str| match k {
+        let rank = |k: &str| match k.to_ascii_lowercase().as_str() {
             "title" => 0,
             "creation_time" | "date" => 1,
             _ => 2,
         };
-        (rank(&a.0), a.0.clone()).cmp(&(rank(&b2.0), b2.0.clone()))
+        (rank(&a.0), a.0.to_ascii_lowercase()).cmp(&(rank(&b2.0), b2.0.to_ascii_lowercase()))
     });
     for (k, v) in &kv {
-        let label = match k.as_str() {
+        let key = k.to_ascii_lowercase();
+        let label = match key.as_str() {
             "title" => "Título",
             "creation_time" => "Creado",
             "date" => "Fecha",
             "encoder" => "Encoder",
             "artist" => "Artista",
             "comment" => "Comentario",
+            "compatible_brands" => "Brands",
+            "major_brand" => "Brand",
+            "minor_version" => "Versión menor",
             _ => k.as_str(),
         };
-        let mut val = v.clone();
+        let mut val = match key.as_str() {
+            // "20240423" → "2024-04-23"; ISO → "YYYY-MM-DD HH:MM:SS UTC"
+            "date" | "creation_time" => pretty_date(v).unwrap_or_else(|| v.clone()),
+            // "isomiso2avc1mp41" → "isom, iso2, avc1, mp41"
+            "compatible_brands" => pretty_brands(v),
+            _ => v.clone(),
+        };
         if val.chars().count() > 70 {
             val = format!("{}…", val.chars().take(69).collect::<String>());
         }
-        let _ = writeln!(o, "  {:<11} {}", format!("{label}:"), val);
+        rows.push((label.to_string(), val));
+    }
+    let pad = rows.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
+    for (label, val) in &rows {
+        let fill = " ".repeat(pad - label.chars().count());
+        let _ = writeln!(o, "  {label}:{fill} {val}");
     }
 
     // -------------------------------------------------------- Pistas --
@@ -338,6 +362,48 @@ fn fmt_epoch(epoch: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
 }
 
+/// Normaliza las fechas típicas de los metadatos de contenedor.
+///
+/// * `"20240423"` (QuickTime/`date`) → `"2024-04-23"`.
+/// * `"2024-04-23T10:31:02.000000Z"` (ISO 8601 / `creation_time`) →
+///   `"2024-04-23 10:31:02 UTC"` (sin la `Z` ni los microsegundos).
+///
+/// Devuelve `None` si el formato no se reconoce; el llamador muestra
+/// entonces el valor tal cual venía.
+fn pretty_date(v: &str) -> Option<String> {
+    let t = v.trim();
+    // "YYYYMMDD" compacto.
+    if t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(format!("{}-{}-{}", &t[..4], &t[4..6], &t[6..8]));
+    }
+    // "YYYY-MM-DD" ya legible: se deja igual (pero se valida).
+    if t.len() == 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-' {
+        return Some(t.to_string());
+    }
+    // ISO 8601: "YYYY-MM-DDTHH:MM:SS[.ffffff][Z]".
+    if t.len() >= 19 && t.as_bytes().get(10) == Some(&b'T') {
+        let (date, time) = (&t[..10], &t[11..19]);
+        let utc = t.ends_with('Z');
+        return Some(format!("{date} {time}{}", if utc { " UTC" } else { "" }));
+    }
+    None
+}
+
+/// Separa la ristra `compatible_brands` en códigos de 4 caracteres:
+/// `"isomiso2avc1mp41"` → `"isom, iso2, avc1, mp41"`. Si la longitud no
+/// es múltiplo de 4 (valor raro), se devuelve tal cual.
+fn pretty_brands(v: &str) -> String {
+    let t = v.trim();
+    if t.len() <= 4 || t.len() % 4 != 0 || !t.is_ascii() {
+        return t.to_string();
+    }
+    t.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +437,28 @@ mod tests {
         assert_eq!(fmt_epoch(0), "1970-01-01 00:00:00");
         // 2024-02-29 12:00:00 UTC (bisiesto)
         assert_eq!(fmt_epoch(1_709_208_000), "2024-02-29 12:00:00");
+    }
+
+    #[test]
+    fn metadata_dates() {
+        assert_eq!(pretty_date("20240423"), Some("2024-04-23".into()));
+        assert_eq!(pretty_date("2024-04-23"), Some("2024-04-23".into()));
+        assert_eq!(
+            pretty_date("2024-04-23T10:31:02.000000Z"),
+            Some("2024-04-23 10:31:02 UTC".into())
+        );
+        assert_eq!(
+            pretty_date("2024-04-23T10:31:02"),
+            Some("2024-04-23 10:31:02".into())
+        );
+        assert_eq!(pretty_date("ayer"), None);
+        assert_eq!(pretty_date("2024"), None);
+    }
+
+    #[test]
+    fn metadata_brands() {
+        assert_eq!(pretty_brands("isomiso2avc1mp41"), "isom, iso2, avc1, mp41");
+        assert_eq!(pretty_brands("isom"), "isom"); // uno solo, sin comas
+        assert_eq!(pretty_brands("abcde"), "abcde"); // longitud rara
     }
 }
