@@ -246,6 +246,7 @@ impl DecoderHandle {
     ///     hacia atrás;
     ///   * el player no toca relojes ni audio — el sonido sigue y los
     ///     frames nítidos entran en cuanto alcanzan al reloj maestro.
+    ///
     /// La cola se drena: contenía hasta ~2.5 s de frames escalados a
     /// las dims viejas (pequeñas), que upscaleados se veían borrosos
     /// — el "tarda en volver la calidad buena" al agrandar.

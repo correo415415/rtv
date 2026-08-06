@@ -130,8 +130,8 @@ unsafe extern "C" fn get_format_cb(
     let want = EXPECTED_HW_FMT.load(Ordering::Acquire);
     if want >= 0 && !fmts.is_null() {
         let mut p = fmts;
-        while (*p).0 as i32 != -1 {
-            if (*p).0 as i32 == want {
+        while (*p).0 != -1 {
+            if (*p).0 == want {
                 return *p;
             }
             p = p.add(1);
@@ -140,7 +140,7 @@ unsafe extern "C" fn get_format_cb(
     // Fallback: primer formato NO-hw de la lista (elección software).
     if !fmts.is_null() {
         let mut p = fmts;
-        while (*p).0 as i32 != -1 {
+        while (*p).0 != -1 {
             let desc = ff::av_pix_fmt_desc_get(*p);
             if !desc.is_null() && ((*desc).flags & ff::AV_PIX_FMT_FLAG_HWACCEL as u64) == 0 {
                 return *p;
@@ -268,7 +268,7 @@ pub unsafe fn try_enable(
             continue;
         }
         (*ctx).get_format = Some(get_format_cb);
-        EXPECTED_HW_FMT.store(hw_fmt.0 as i32, Ordering::Release);
+        EXPECTED_HW_FMT.store(hw_fmt.0, Ordering::Release);
         return Some(ActiveHw {
             device_type: dev_type,
             hw_pix_fmt: hw_fmt,
@@ -305,7 +305,7 @@ pub fn transfer_to_ram(
 
 /// ¿Es `fmt` el formato HW activo? (comparación por valor crudo).
 pub fn is_hw_frame(frame: &ffmpeg::util::frame::video::Video, hw: &ActiveHw) -> bool {
-    unsafe { (*frame.as_ptr()).format == hw.hw_pix_fmt.0 as i32 }
+    unsafe { (*frame.as_ptr()).format == hw.hw_pix_fmt.0 }
 }
 
 /// Nombre legible de un device type guardado como i32 crudo (para el

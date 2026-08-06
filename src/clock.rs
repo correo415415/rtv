@@ -117,8 +117,7 @@ impl FfClock {
 
     /// Bump del serial. Llamar ANTES de tocar el pts.
     pub fn bump_serial(&self) -> i32 {
-        let s = self.serial.fetch_add(1, Ordering::AcqRel) + 1;
-        s
+        self.serial.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn current_serial(&self) -> i32 {
@@ -334,9 +333,7 @@ impl Clock for MasterClock {
 /// * Si va ADELANTADO poco (diff >= threshold):
 ///   `delay = 2 * delay` — dobla el delay para dejarlo alcanzar.
 pub fn compute_target_delay(natural_delay: f64, diff: f64) -> f64 {
-    let sync_threshold = natural_delay
-        .max(AV_SYNC_THRESHOLD_MIN)
-        .min(AV_SYNC_THRESHOLD_MAX);
+    let sync_threshold = natural_delay.clamp(AV_SYNC_THRESHOLD_MIN, AV_SYNC_THRESHOLD_MAX);
 
     if diff.is_finite() && diff.abs() < AV_NOSYNC_THRESHOLD {
         if diff <= -sync_threshold {
@@ -409,7 +406,7 @@ mod tests {
         c.set_pts(10.0, 0);
         sleep(Duration::from_millis(100));
         let t = c.now();
-        assert!(t >= 10.09 && t < 10.20, "esperado ~10.10, got {t}");
+        assert!((10.09..10.20).contains(&t), "esperado ~10.10, got {t}");
     }
 
     #[test]

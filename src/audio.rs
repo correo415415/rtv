@@ -246,7 +246,7 @@ fn try_cpal_plan(out_channels: u16) -> Option<(SinkPlan, u32)> {
             sample_rate: cpal::SampleRate(rate),
             buffer_size: cpal::BufferSize::Default,
         };
-        return Some((SinkPlan::Cpal(device, config), rate));
+        Some((SinkPlan::Cpal(device, config), rate))
     }
     #[cfg(not(feature = "cpal-audio"))]
     {
@@ -261,10 +261,10 @@ fn try_pulse_plan(out_channels: u16) -> Option<(SinkPlan, u32)> {
         // 48 kHz: nativo de PulseAudio en Android/Termux y estándar
         // de facto; swresample normaliza cualquier pista a esto.
         match crate::audio_backend::pulse::PulseSink::try_open(48000, out_channels) {
-            Ok(s) => return Some((SinkPlan::Pulse(s), 48000)),
+            Ok(s) => Some((SinkPlan::Pulse(s), 48000)),
             Err(e) => {
                 eprintln_verbose(&format!("pulse no disponible: {e}"));
-                return None;
+                None
             }
         }
     }

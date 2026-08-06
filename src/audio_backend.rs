@@ -9,8 +9,8 @@
 //! compartido por AMBOS backends:
 //!
 //!   * cpal  (audio.rs): el callback llama a `feeder.fill(out, delay)`.
-//!   * pulse (aquí):     un hilo writer llama a `feeder.fill(buf, delay)`
-//!                       y bloquea en `pa_simple_write`.
+//!   * pulse (aquí): un hilo writer llama a `feeder.fill(buf, delay)`
+//!     y bloquea en `pa_simple_write`.
 //!
 //! El backend pulse carga libpulse-simple con dlopen (libloading) en
 //! runtime: CERO dependencia de build o de arranque — si la lib o el

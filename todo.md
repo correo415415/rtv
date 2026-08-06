@@ -663,3 +663,35 @@ Análisis de viabilidad + implementación completa (fases 1-3) en la misma sesi�
         (linux/aarch64/exe/macos) responden 200.
     Nota: termux_audio_check parsea "pts_first=", no "pts=" (pillado
         al escribir el test de seek ad-hoc).
+
+[x] AUTO-ROTACIÓN por Display Matrix (vídeos de móvil en vertical):
+    [x] src/rotation.rs: lee coded_side_data del codecpar
+        (av_packet_side_data_get + av_display_rotation_get por FFI;
+        el wrapper Stream::side_data de ffmpeg-the-third lee el array
+        legacy de AVStream, deprecado y vacío con demuxers modernos)
+        + fallback al tag `rotate` (MKV/MOV antiguos). θ presentación
+        = -av_display_rotation_get (convención ffplay); normalizado
+        al cardinal más cercano (0/90/180/270).
+    [x] Rotación del RGB24 YA ESCALADO en el hilo decoder (sws escala
+        a dims transpuestas con 90/270 y rotate_frame in-place después;
+        rotar el frame pequeño destino, no el fuente 4K). decode_loop
+        + drain. source_size = tamaño de PRESENTACIÓN ⇒ el player
+        (layout/aspect/resize/refine) no necesita ni un cambio.
+    [x] --info: dims presentadas transpuestas + "rotado N°" +
+        quality_label por el lado MENOR (1080x1920 vertical = 1080p).
+    [x] Tests: 7 unit (mapeo por píxel de las 3 rotaciones, ida+vuelta,
+        normalización θ, dims, signos contra av_display_rotation_get
+        real) + tests/integration_rotation.py (fixture rojo/azul con
+        -display_rotation -90, pty + backend blocks, verificación de
+        PÍXELES por mitades: izquierda azul / derecha roja) — en CI.
+    [x] Validado en local: 38/38 tests, -Dwarnings limpio (default y
+        pulse), integration_rotation PASS con píxeles verificados,
+        270°/180° y fallback tag rotate (MKV) comprobados con --info.
+    [x] clippy --all-targets a CERO warnings (limpieza general:
+        needless_return, let_and_return, manual clamp/contains/
+        is_multiple_of, casts i32 redundantes, docs mal indentadas).
+    Nota: -display_rotation es opción de INPUT de ffmpeg (va antes de
+        -i); el tag rotate en MP4 out ya no lo escribe ffmpeg moderno
+        (usar MKV para testear el fallback). En el parser del test los
+        bytes de continuación UTF-8 no avanzan columna, y el blocks
+        emite FG/BG en SGRs SEPARADOS.
