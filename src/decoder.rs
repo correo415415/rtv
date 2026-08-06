@@ -356,10 +356,16 @@ pub fn spawn<P: AsRef<Path>>(
         30.0
     };
 
+    // Auto-rotación (Display Matrix / tag rotate): vídeos de móvil
+    // grabados en vertical se almacenan apaisados + metadato "rota
+    // 90° al presentar". Se aplica al frame RGB YA escalado (barato)
+    // y `source_size` pasa a ser el tamaño TAL COMO SE PRESENTA —
+    // el player calcula aspect/layout sin enterarse de nada.
+    let transform = crate::rotation::from_stream(&stream);
+
     let (decoder, active_hw) = open_video_decoder(&stream, hw_pref)?;
 
-    let src_w = decoder.width();
-    let src_h = decoder.height();
+    let (src_w, src_h) = transform.display_size(decoder.width(), decoder.height());
 
     // Cola de pre-decode adaptativa por PRESUPUESTO DE MEMORIA
     // (~48 MB): con frames pequeños (ascii/halfblocks) caben 64 →
@@ -405,6 +411,7 @@ pub fn spawn<P: AsRef<Path>>(
                 stop_th,
                 eof_th.clone(),
                 serial_th,
+                transform,
             );
             eof_th.store(true, Ordering::Relaxed);
         })?;
@@ -511,6 +518,7 @@ fn decode_loop(
     stop: Arc<AtomicBool>,
     eof: Arc<AtomicBool>,
     serial_atomic: Arc<AtomicI32>,
+    transform: crate::rotation::Transform,
 ) -> Result<()> {
     let mut ictx = crate::source::open(&path)?;
     let time_base = ictx
@@ -690,6 +698,7 @@ fn decode_loop(
                     current_serial,
                     &serial_atomic,
                     &mut drop_until,
+                    transform,
                 );
                 eof.store(true, Ordering::Relaxed);
                 // NO salimos del hilo: nos aparcamos esperando un
@@ -757,11 +766,15 @@ fn decode_loop(
             // escalar: el resize se aplica al mismísimo siguiente
             // frame (coalescencia atómica; el Scaler reconstruye si
             // cambia cualquier dimensión de entrada o de salida).
+            // Con rotación 90/270 se escala a las dims TRANSPUESTAS:
+            // tras rotar, el frame queda exactamente en (dst_w, dst_h).
             let (dst_w, dst_h) = unpack_dims(target_dims.load(Ordering::Acquire));
-            let out = match scaler.scale(src, dst_w, dst_h) {
+            let (sc_w, sc_h) = transform.pre_rotate_dims(dst_w, dst_h);
+            let mut out = match scaler.scale(src, sc_w, sc_h) {
                 Some(rgb) => build_rgb_frame(rgb, pts_secs, current_serial),
                 None => continue,
             };
+            crate::rotation::rotate_frame(&mut out, transform);
             last_emitted_pts = pts_secs;
             if !first_emitted_logged {
                 first_emitted_logged = true;
@@ -874,6 +887,7 @@ fn drain(
     current_serial: i32,
     serial_atomic: &Arc<AtomicI32>,
     drop_until: &mut Option<f64>,
+    transform: crate::rotation::Transform,
 ) {
     while decoder.receive_frame(frame).is_ok() {
         if stop.load(Ordering::Relaxed) {
@@ -905,10 +919,12 @@ fn drain(
             _ => &*frame,
         };
         let (dst_w, dst_h) = unpack_dims(target_dims.load(Ordering::Acquire));
-        let out = match scaler.scale(src, dst_w, dst_h) {
+        let (sc_w, sc_h) = transform.pre_rotate_dims(dst_w, dst_h);
+        let mut out = match scaler.scale(src, sc_w, sc_h) {
             Some(rgb) => build_rgb_frame(rgb, pts_secs, current_serial),
             None => continue,
         };
+        crate::rotation::rotate_frame(&mut out, transform);
         if send_with_stop(tx, out, stop, serial_atomic, current_serial).is_err() {
             break;
         }

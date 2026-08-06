@@ -259,6 +259,15 @@ jobs:
             http://127.0.0.1:8124/dual_v.mp4 \
             --audio-file http://127.0.0.1:8124/dual_a.m4a --audio-backend pulse
 
+      - name: Test de AUTO-ROTACIÓN (Display Matrix)
+        run: |
+          set -euo pipefail
+          # Vídeo "de móvil": apaisado 320x180 + Display Matrix de 90°.
+          # rtv debe presentarlo VERTICAL (180x320): --info lo verifica
+          # sin PTY, y el test de integración comprueba los PÍXELES de
+          # la salida (mitades roja/azul en el lado correcto tras rotar).
+          python3 tests/integration_rotation.py /tmp/smoke-pkg/rtv
+
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.pkg.outputs.pkg }}

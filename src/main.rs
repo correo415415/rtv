@@ -20,6 +20,7 @@ mod info;
 mod input;
 mod player;
 mod renderer;
+mod rotation;
 mod source;
 mod subs;
 mod terminfo;
