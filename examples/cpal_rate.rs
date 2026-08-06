@@ -20,7 +20,7 @@ fn main() {
         let ts = info.timestamp();
         let d = ts.playback.duration_since(&ts.callback).map(|d| d.as_secs_f64()).unwrap_or(-1.0);
         static PRINTED: AtomicU64 = AtomicU64::new(0);
-        if PRINTED.fetch_add(1, Ordering::Relaxed) % 50 == 0 {
+        if PRINTED.fetch_add(1, Ordering::Relaxed).is_multiple_of(50) {
             eprintln!("cb: buf={} delay={:.4}s", out.len(), d);
         }
     }, |e| eprintln!("err {e}"), None).expect("build");

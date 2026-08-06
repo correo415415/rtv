@@ -449,7 +449,7 @@ fn pretty_date(v: &str) -> Option<String> {
 /// es múltiplo de 4 (valor raro), se devuelve tal cual.
 fn pretty_brands(v: &str) -> String {
     let t = v.trim();
-    if t.len() <= 4 || t.len() % 4 != 0 || !t.is_ascii() {
+    if t.len() <= 4 || !t.len().is_multiple_of(4) || !t.is_ascii() {
         return t.to_string();
     }
     t.as_bytes()

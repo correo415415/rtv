@@ -679,6 +679,7 @@ impl Renderer {
 ///     terminales lentas. El padding hasta `cols` ya cubre la fila
 ///     entera, así que la escritura es idéntica visualmente pero
 ///     atómica (sin estado intermedio en blanco).
+///
 /// Paleta fija sixel: cubo RGB 6×7×6 (252 registros). El eje verde
 /// lleva 7 niveles (sensibilidad del ojo). Los valores van en escala
 /// 0..100 como exige el protocolo (`#n;2;r;g;b`). Se construye una

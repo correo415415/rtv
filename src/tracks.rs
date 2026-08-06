@@ -95,6 +95,7 @@ fn codec_short_name(id: ffmpeg::codec::Id) -> String {
 ///   * `lang` — código de idioma; matching flexible case-insensitive
 ///     por prefijo en cualquier dirección ("en" casa con "eng" y
 ///     "eng" con "en").
+///
 /// Devuelve la POSICIÓN dentro de `tracks` (no el stream_index), o
 /// `None` si no hay match (el caller decide el fallback).
 pub fn select(tracks: &[TrackInfo], id: Option<usize>, lang: Option<&str>) -> Option<usize> {
