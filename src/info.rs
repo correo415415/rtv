@@ -169,11 +169,20 @@ fn render(
         let p = unsafe { &*s.parameters().as_ptr() };
         let codec = codec_name(s.parameters().id());
         let mut line = format!("  #{} {}", i + 1, b(&codec));
+        let rot = crate::rotation::from_stream(s);
         if p.width > 0 && p.height > 0 {
-            let _ = write!(line, "  {}x{}", p.width, p.height);
-            if let Some(q) = quality_label(p.height) {
+            // Dims TAL COMO SE PRESENTAN (con Display Matrix 90/270
+            // se transponen — igual que las verá el player).
+            let (dw, dh) = rot.display_size(p.width as u32, p.height as u32);
+            let _ = write!(line, "  {}x{}", dw, dh);
+            // Etiqueta por el lado MENOR: un vertical 1080x1920 es
+            // "1080p" (como YouTube/mpv), no "1440p".
+            if let Some(q) = quality_label(dw.min(dh) as i32) {
                 let _ = write!(line, " ({q})");
             }
+        }
+        if let Some(r) = rot.label() {
+            let _ = write!(line, "  {r}");
         }
         let fps = s.avg_frame_rate();
         if fps.numerator() > 0 && fps.denominator() > 0 {
