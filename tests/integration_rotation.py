@@ -2,9 +2,11 @@
 """Test de integración: auto-rotación por Display Matrix.
 
 Fixture: vídeo APAISADO 320x180 cuya mitad SUPERIOR es roja y la
-INFERIOR azul, remuxeado con -display_rotation -90 (la matriz que
-escribe un iPhone en vertical). Presentado correctamente (90° horario)
-queda VERTICAL 180x320 con la mitad IZQUIERDA azul y la DERECHA roja.
+INFERIOR azul, con la Display Matrix de un iPhone en vertical escrita
+directamente en la caja tkhd del MP4 (la opción -display_rotation de
+ffmpeg solo existe desde FFmpeg 6, y los runners de CI llevan 4.4).
+Presentado correctamente (90° horario) queda VERTICAL 180x320 con la
+mitad IZQUIERDA azul y la DERECHA roja.
 
 Se reproduce con --backend blocks en un pty y se parsean los SGR de
 color 24-bit (38;2;r;g;b / 48;2;r;g;b) de la salida: el test exige
@@ -20,6 +22,7 @@ import pty
 import re
 import select
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -32,21 +35,64 @@ def run(cmd, **kw):
     subprocess.run(cmd, check=True, **kw)
 
 
+def write_rot90_matrix(path):
+    """Escribe en la caja tkhd la Display Matrix de un iPhone grabando
+    en vertical (presentación 90° horario): [0, 1, 0; -1, 0, 0; 0, 0, 1]
+    en punto fijo 16.16 (w en 2.30). Es la MISMA matriz que valida el
+    test unitario FFI de src/rotation.rs, y no depende de la versión de
+    ffmpeg (-display_rotation solo existe desde FFmpeg 6)."""
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+
+    def find_box(kind, start, end):
+        """Devuelve (payload_start, payload_end) de la primera caja
+        `kind` entre cajas hermanas — recorrido ISO-BMFF real, no un
+        find() a ciegas (los bytes podrían aparecer dentro del mdat)."""
+        pos = start
+        while pos + 8 <= end:
+            size = int.from_bytes(data[pos:pos + 4], "big")
+            name = bytes(data[pos + 4:pos + 8])
+            hdr = 8
+            if size == 1:
+                size = int.from_bytes(data[pos + 8:pos + 16], "big")
+                hdr = 16
+            elif size == 0:
+                size = end - pos
+            if name == kind:
+                return pos + hdr, pos + size
+            pos += size
+        raise AssertionError(f"sin caja {kind!r} en el MP4")
+
+    s, e = find_box(b"moov", 0, len(data))
+    s, e = find_box(b"trak", s, e)
+    idx, _ = find_box(b"tkhd", s, e)
+    idx -= 4  # las cuentas de abajo parten del nombre 'tkhd'
+    version = data[idx + 4]
+    # Offset de la matriz dentro del payload: version/flags (4) +
+    # tiempos/track_id/duración (20 en v0, 32 en v1) + reserved (8) +
+    # layer/alternate_group/volume/reserved (8).
+    off = idx + 4 + 4 + (32 if version == 1 else 20) + 8 + 8
+    # Byte a byte lo MISMO que escribe `ffmpeg -display_rotation -90`
+    # (verificado extrayendo la tkhd de un fixture de referencia):
+    # el mov demuxer la entrega tal cual como AV_PKT_DATA_DISPLAYMATRIX
+    # y av_display_rotation_get devuelve -90 → presentación 90° horario.
+    m = [0, 65536, 0, -65536, 0, 0, 0, 0, 1 << 30]
+    data[off:off + 36] = struct.pack(">9i", *m)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 def make_fixture(tmp):
-    plain = os.path.join(tmp, "redblue.mp4")
-    rot = os.path.join(tmp, "redblue_rot90.mp4")
+    video = os.path.join(tmp, "redblue_rot90.mp4")
     run([
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "lavfi", "-i", "color=red:size=320x90:rate=30",
         "-f", "lavfi", "-i", "color=blue:size=320x90:rate=30",
         "-filter_complex", "[0][1]vstack", "-t", "2",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", plain,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", video,
     ])
-    run([
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-display_rotation", "-90", "-i", plain, "-c", "copy", rot,
-    ])
-    return rot
+    write_rot90_matrix(video)
+    return video
 
 
 def capture_pty(rtv, video, seconds=4.0):
